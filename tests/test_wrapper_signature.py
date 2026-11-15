@@ -25,52 +25,22 @@ model-free, and guard against the signature drifting out of sync again.
 Run standalone:  python tests/test_wrapper_signature.py
 Or via pytest:   pytest tests/test_wrapper_signature.py
 """
-import importlib.util
 import os
 import sys
 
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PACK = os.path.dirname(_HERE)                       # .../custom_nodes/comfyui-krea2edit
-_COMFY_ROOT = os.path.dirname(os.path.dirname(_PACK))  # .../ComfyUI
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-# ComfyUI root must be importable so the pack's ``import comfy.*`` lines resolve.
-if _COMFY_ROOT not in sys.path:
-    sys.path.insert(0, _COMFY_ROOT)
-
-
-def _load_pack():
-    """Import the pack's __init__.py under a synthetic name (folder has a hyphen)."""
-    spec = importlib.util.spec_from_file_location(
-        "comfyui_krea2edit_under_test", os.path.join(_PACK, "__init__.py")
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-class _FakeInner:
-    def process_latent_in(self, x):
-        return x
-
-
-class _FakeModelPatcher:
-    """Minimal stand-in for comfy.model_patcher.ModelPatcher, only what patch() touches."""
-    def __init__(self):
-        self.model = _FakeInner()
-        self.model_options = {}
-
-    def clone(self):
-        c = _FakeModelPatcher()
-        c.model = self.model  # share inner model, like the real clone
-        return c
+from stubs import _FakeModelPatcher, _load_pack, _node   # noqa: E402
 
 
 def _get_wrapper(mod):
     import comfy.patcher_extension as pe
 
-    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), {"samples": object()})
+    m, _ = _node(mod, _FakeModelPatcher(), {"samples": torch.zeros(1, 4, 8, 8)})
     to = m.model_options["transformer_options"]
     return to["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
 
@@ -127,6 +97,24 @@ def test_transformer_options_picked_up_under_both_signatures():
         else:
             executor.execute(torch.zeros(1, 4, 8, 8), None, None, None, ["ref"], marker)     # ...ref_latents, t_opts
         assert captured["to"] is marker, f"{shape}: got {captured['to']}, expected the trailing dict"
+
+
+def test_a_source_of_another_size_than_the_sampled_latent_warns_once():
+    import contextlib
+    import io
+
+    import comfy.patcher_extension as pe
+
+    mod = _load_pack()
+    mod.krea2_edit_forward = lambda *a, **k: None
+    for sampled, warns in ((8, 0), (6, 1)):
+        wrapper = _get_wrapper(mod)
+        executor = pe.WrapperExecutor(original=lambda *a, **k: None, class_obj=object(), wrappers=[wrapper], idx=0)
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            for _ in range(3):
+                executor.execute(torch.zeros(1, 4, sampled, sampled), None, None, None, {})
+        assert log.getvalue().count("WARNING: source_latent_a is 64x64px but the picture is drawn at") == warns, sampled
 
 
 if __name__ == "__main__":

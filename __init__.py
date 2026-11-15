@@ -7,6 +7,8 @@ from the (noisy) target purely by the 3-axis RoPE frame index (source=1, target=
 aligned). This node adds that by wrapping the model's DIFFUSION_MODEL forward and rebuilding
 the sequence as `[text | source(frame=1) | target(frame=0)]`, keeping only the target tokens
 out — mirroring ai-toolkit's `predict_velocity_edit` exactly, using the model's own submodules.
+On top of that the source hold pulls the sampler's denoised estimate back to the source latent (optionally
+limited by an edit mask), so edits do not shift or darken the rest of the picture.
 
 Wiring:  LoadImage -> VAEEncode(source) --\
                                             Krea2EditAdvanced(model, source_latent_a) -> KSampler
@@ -18,10 +20,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 import comfy.patcher_extension
-import comfy.samplers
 import comfy.utils
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
@@ -67,6 +67,12 @@ def _place_refs(ref_ids, modes, h_, w_):
     return out
 
 
+def _patchify(x, patch):
+    """(b, c, h * patch, w * patch) -> (b, h * w, c * patch * patch)."""
+    b, c, H, W = x.shape
+    return x.reshape(b, c, H // patch, patch, W // patch, patch).permute(0, 2, 4, 1, 3, 5).reshape(b, (H // patch) * (W // patch), c * patch * patch)
+
+
 def _to_4d(v):
     """(B,C,T,H,W) -> (B*T,C,H,W); pass 4D through. Images use T=1."""
     if v.ndim == 5:
@@ -108,18 +114,67 @@ def _fit_src(src, H, W):
 
 def _place_ref(ref, mask, H, W):
     """Reference a on the target's latent grid: padded to whole tokens and fitted like krea2_edit_forward fits a
-    source. Returns the reference, its coverage and its mask weight (the MASK drawn on the reference, 1 without one),
-    cropped to H x W."""
+    source. Returns the reference and the mask (drawn on the reference) averaged onto that grid, cropped to H x W."""
     Hp, Wp = -(-H // TOKEN) * TOKEN, -(-W // TOKEN) * TOKEN
     ref = comfy.ldm.common_dit.pad_to_patch_size(_to_4d(ref), (TOKEN, TOKEN), padding_mode="replicate")
     if ref.shape[-2:] != (Hp, Wp):
-        if mask is not None:
-            mask = _crop_mask(mask, *ref.shape[-2:], _fit_box(*ref.shape[-2:], Hp, Wp))
+        mask = _crop_mask(mask, *ref.shape[-2:], _fit_box(*ref.shape[-2:], Hp, Wp))
         ref = _fit_src(ref, Hp, Wp)
-    weight = ref.new_ones(1, 1, Hp, Wp)
-    if mask is not None:
-        weight = F.interpolate((mask if mask.ndim == 3 else mask[None])[:1][None].float(), size=(Hp, Wp), mode="area")
-    return ref[..., :H, :W], ref.new_ones(1, 1, H, W), weight[..., :H, :W]
+    weight = F.interpolate((mask if mask.ndim == 3 else mask[None])[:1][None].float(), size=(Hp, Wp), mode="area")
+    return ref[..., :H, :W], weight[..., :H, :W]
+
+
+DISC = 24          # largest disc radius (pixels) filtered exactly; a larger one is filtered on a coarser grid
+
+
+def _disc_max(m, r):
+    """Maximum of m (1, 1, H, W) over a disc of radius r pixels: one 1-D max-pool per row of the disc. The border repeats its edge pixels."""
+    if r <= 0:
+        return m
+    h, w = m.shape[-2:]
+    f = max(1, math.ceil(r / DISC))
+    if f > 1:
+        m = F.max_pool2d(m, f, ceil_mode=True)                  # max keeps thin strokes; an average would dilute them
+    hl, wl = m.shape[-2:]
+    r = max(1, round(r / f))
+    p = F.pad(m, (r, r, r, r), mode="replicate")
+    out = None
+    for dy in range(-r, r + 1):
+        half = int((r * r - dy * dy) ** 0.5)
+        row = F.max_pool2d(p[..., r + dy:r + dy + hl, :], (1, 2 * half + 1), 1, (0, half))[..., r:r + wl]
+        out = row if out is None else torch.maximum(out, row)
+    return out if f == 1 else F.interpolate(out, size=(h, w), mode="bilinear")
+
+
+def _gaussian(m, sigma):
+    """Gaussian blur of m (1, 1, H, W), sigma in pixels, edge pixels repeated; a large sigma is blurred on a coarser grid."""
+    if sigma < 0.5:
+        return m
+    h, w = m.shape[-2:]
+    f = max(1, int(sigma // 8))
+    if f > 1:
+        m = F.interpolate(m, size=(-(-h // f), -(-w // f)), mode="area")
+    sigma = sigma / f
+    r = math.ceil(3 * sigma)
+    k = torch.exp(-torch.arange(-r, r + 1, dtype=m.dtype) ** 2 / (2 * sigma ** 2))
+    k = k / k.sum()
+    m = F.conv2d(F.pad(m, (r, r, r, r), mode="replicate"), k.view(1, 1, 1, -1))
+    m = F.conv2d(m, k.view(1, 1, -1, 1))
+    return m if f == 1 else F.interpolate(m, size=(h, w), mode="bilinear")
+
+
+def _edit_mask(mask, size, grow_percent, feather_percent):
+    """The edit area on the pixel grid `size` = (h, w): the drawn MASK (white everywhere without one) grown (positive) or shrunk
+    (negative) by a disc, then feathered; both in percent of the shorter side. Returns (1, h, w) in 0..1."""
+    h, w = size
+    if mask is None:
+        m = torch.ones(1, 1, h, w)
+    else:
+        m = (mask if mask.ndim == 3 else mask[None])[:1][None].float()
+        m = F.interpolate(m, size=(h, w), mode="area" if m.shape[-2] >= h else "bilinear")
+    r = grow_percent * min(h, w) / 100
+    m = _disc_max(m, round(r)) if r > 0 else 1 - _disc_max(1 - m, round(-r))
+    return _gaussian(m, feather_percent * min(h, w) / 100).clamp(0, 1)[0]
 
 
 def _ref_attn_bias(boosts, masks, txtlen, slens, tgtlen, mask_hw, device, dtype):
@@ -185,7 +240,6 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
         if src.shape[0] != bs:
             src = src[:1].expand(bs, *src.shape[1:])
         if src.shape[-2:] != (H, W):
-            print(f"[krea2edit] LATENT-PATH fit_src (crop): src={tuple(src.shape[-2:])} -> {H}x{W}", flush=True)
             sh, sw = src.shape[-2:]
             if masks[i] is not None:
                 masks[i] = _crop_mask(masks[i], sh, sw, _fit_box(sh, sw, H, W))
@@ -195,9 +249,8 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
 
     context = m._unpack_context(context)                       # (B, seq, 12, 2560)
 
-    tgt_img = m.first(rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch))
-    src_imgs = [m.first(rearrange(s_, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch))
-                for s_ in srcs]
+    tgt_img = m.first(_patchify(x, patch))
+    src_imgs = [m.first(_patchify(s_, patch)) for s_ in srcs]
 
     t = m.tmlp(timestep_embedding(timesteps, m.tdim).unsqueeze(1).to(tgt_img.dtype))
     tvec = m.tproj(t)
@@ -231,8 +284,7 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
 
     final = m.last(combined, t)
     out = final[:, txtlen + srclen: txtlen + srclen + tgtlen, :]         # target tokens only
-    out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                    h=h_, w=w_, ph=patch, pw=patch, c=m.channels)
+    out = out.reshape(bs, h_, w_, m.channels, patch, patch).permute(0, 3, 1, 4, 2, 5).reshape(bs, m.channels, h_ * patch, w_ * patch)
     out = out[:, :, :H_orig, :W_orig]
     if temporal:
         out = out.reshape(b5, t5, m.channels, H_orig, W_orig).movedim(1, 2)
@@ -240,48 +292,28 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
 
 
 # ---------------------------------------------------------------------------------------------------------
-# Reference guidance: pull the denoised estimate toward the aligned reference latent.
+# Source hold: pull the denoised estimate toward the source latent.
 #
-# At every step the sampler's x0 estimate is blended toward the reference, x0' = x0 + w * (ref - x0). This is
-# the same update as blending the velocity toward the reference's straight-line velocity (RF-Inversion's
+# At every step the sampler's x0 estimate is blended toward the source, x0' = x0 + w * (src - x0). This is
+# the same update as blending the velocity toward the source's straight-line velocity (RF-Inversion's
 # controller guidance). Output preservation is decided by the late steps, layout by the early ones, so the
-# schedule has two phases split at `crossover * sigma_start`. Two optional gates let the model deviate where
-# it clearly wants to:
-# - distance gate (late phase): tokens whose estimate is far from the reference are left alone;
-# - edit-map gate: tokens where the instruction changes the prediction (cond vs uncond) are left alone.
+# schedule has two phases split at `crossover * sigma_start`. Where the mask is 0 (the edit area) the late
+# pull is gated by distance: tokens whose estimate is far from the source are left alone, so an edit that
+# the model clearly wants to make is not pulled back, while the rest of the edit area is held.
 # ---------------------------------------------------------------------------------------------------------
 TOKEN = 2  # latent cells per token side (patch size)
 
 
 @dataclass
 class GuideConfig:
-    ref_guide: float = 0.0     # pull strength 0..1; 0 = off, 1 = copy the reference where the mask allows
+    ref_guide: float = 0.9     # pull strength 0..1; 1 = copy the source where the weight is full
     crossover: float = 0.5     # early phase = sigma above crossover * sigma_start
-    late_gain: float = 1.0     # late-phase strength = min(1, late_gain * ref_guide); 0 = early phase only
-    early_gain: float = 1.0    # early-phase strength = early_gain * ref_guide; 0 = late phase only
-    early_decay: float = 0.0   # LAB: the early pull falls with sigma as ((sigma - crossover * sigma0) / (sigma0 - crossover * sigma0)) ** early_decay; 0 = constant
-    early_hold: float = 0.0    # LAB: with early_outside, the early pull where the mask is 0 (everywhere without a mask) peaks at min(X, 1) and falls with sigma with exponent 2 / X; 0 = off
-    dist_tau: float = 0.0      # distance-gate tolerance in reference-std units; 0 = off
-    dist_calib: float = 0.0    # LAB: tolerance = dist_calib * the 90th percentile of the distance outside the mask; 0 = use dist_tau
-    dist_pow: float = 2.0      # LAB: steepness n of the gate d^n / (d^n + tol^n)
-    dist_blur: float = 0.0     # LAB: blur of the distance map, in tokens
-    free_latch: bool = False   # LAB: a token the gate has freed stays free for the rest of the late phase
-    free_grow: int = 0         # LAB: the freed region grows by this many tokens (then softens by one token)
-    edit_thr: float = 0.0      # edit-map threshold in (0, 1); 0 = off
-    edit_start: float = 0.9    # edit map is estimated for sigma in [edit_end, edit_start] * sigma_start
-    edit_end: float = 0.5
-    edit_soft: float = 0.3     # LAB: width of the smoothstep around the edit threshold
-    edit_q: float = 0.95       # LAB: the edit map is normalised by this quantile of its values
-    edit_grow: int = 0         # LAB: the region the edit map frees grows by this many tokens
-    edit_region_norm: bool = False  # LAB: the edit map is normalised over the masked region (mask < 0.5) instead of the whole image
-    gate_and: bool = False     # LAB: a token is freed only when the distance gate AND the edit gate agree (default: either)
-    gate_gamma: float = 1.0    # LAB: with gate_in_mask the freedom is scaled by (1 - mask) ** gate_gamma
-    early_outside: bool = False  # LAB: the early-phase pull ignores the inside floor, i.e. is zero where the mask is 0
-    inside: float = 0.0       # pull where the mask is 0, as a fraction of the pull where it is 1 (linear in between)
-    gate_in_mask: bool = False  # the gates free tokens only where the mask is 0; where it is 1 the pull is unconditional
-    feather: float = 0.0       # blur radius of the weight map, as a fraction of the latent side
-    smooth: float = 0.5        # across-step memory of the gate maps (0 = none)
-    debug: bool = False        # LAB ONLY: print gate statistics and dump the maps as PNGs under output/guide_lab_debug
+    late_gain: float = 10.0    # late-phase strength = min(1, late_gain * ref_guide)
+    early_gain: float = 0.8    # early-phase strength outside the edit area = early_gain * ref_guide
+    early_hold: float = 0.0    # hold knob: the early pull inside the edit area peaks at min(X, 1) and falls with sigma with exponent 2 / X; 0 = none
+    dist_tau: float = 0.02     # distance-gate tolerance in source-std units; 0 = off
+    dist_pow: float = 8.0      # steepness n of the gate d^n / (d^n + tol^n)
+    smooth: float = 0.5        # across-step memory of the distance map (0 = none)
 
 
 def step_weights(sigmas, ref_guide, crossover, late_gain, early_gain=1.0, early_decay=0.0):
@@ -305,148 +337,51 @@ def token_rms(a, b):
     return F.interpolate(sq, size=a.shape[-2:], mode="nearest").sqrt()
 
 
-def blur(m, radius):
-    if radius < 1:
-        return m
-    return F.avg_pool2d(F.pad(m, (radius,) * 4, mode="replicate"), 2 * radius + 1, stride=1)
-
-
-def _grow(m, tokens):
-    """Grow a map by `tokens` tokens (max filter), then soften it by one token."""
-    r = tokens * TOKEN
-    return blur(F.max_pool2d(m, 2 * r + 1, stride=1, padding=r), TOKEN)
-
-
-def _smoothstep(x):
-    x = x.clamp(0, 1)
-    return x * x * (3 - 2 * x)
-
-
 class Guide:
     """State of one sampling run. Build a new one per run."""
 
     def __init__(self, cfg, sigmas):
         self.cfg = cfg
         self.sigmas = [float(s) for s in sigmas]
-        self.plan = step_weights(self.sigmas, cfg.ref_guide, cfg.crossover, cfg.late_gain, cfg.early_gain, cfg.early_decay)
+        self.plan = step_weights(self.sigmas, cfg.ref_guide, cfg.crossover, cfg.late_gain, cfg.early_gain)
         self.hold = [e for e, _ in step_weights(self.sigmas, cfg.ref_guide, cfg.crossover, cfg.late_gain, min(cfg.early_hold, 1.0), 2.0 / cfg.early_hold)] if cfg.early_hold > 0 else [0.0] * len(self.plan)
         self.ref_std = None
         self.dist = None
-        self.free_max = None
-        self.edit_ema = None
-        self.edit_acc = None
-        self.tag = None
-
-    def _debug(self, i, sigma, w):
-        """LAB ONLY (remove with the lab node): per-step statistics and maps."""
-        import os
-        import time
-        from PIL import Image
-        self.tag = self.tag or time.strftime("%H%M%S")
-        quant = lambda t: " ".join(f"{float(v):.2f}" for v in torch.quantile(t.flatten().float(), torch.tensor([0.1, 0.5, 0.9, 0.99], device=t.device)))
-        line = f"[krea2edit] guide step {i + 1}/{len(self.plan)} sigma {float(torch.as_tensor(sigma).flatten()[0]):.3f} early {self.plan[i][0]:.2f} late {self.plan[i][1]:.2f} | pull q10/50/90/99 {quant(w)}"
-        maps = {"pull": w}
-        if self.dist is not None:
-            line += f" | dist {quant(self.dist)}"
-            maps["dist"] = self.dist / 2
-        if self.edit_acc is not None:
-            line += f" | edit {quant(self.edit_acc)}"
-            maps["edit"] = self.edit_acc
-        print(line, flush=True)
-        folder = os.path.join("output", "guide_lab_debug", self.tag)
-        os.makedirs(folder, exist_ok=True)
-        for name, t in maps.items():
-            a = (t[0, 0].float().clamp(0, 1) * 255).byte().cpu().numpy()
-            Image.fromarray(a).resize((a.shape[1] * 4, a.shape[0] * 4), Image.NEAREST).save(os.path.join(folder, f"{i + 1:02d}_{name}.png"))
 
     def step_of(self, sigma):
         s = float(torch.as_tensor(sigma).flatten()[0])
         return min(range(len(self.plan)), key=lambda i: abs(self.sigmas[i] - s))
 
-    def needs_uncond(self, sigma):
+    def _distance_freedom(self, x0, ref):
         cfg = self.cfg
-        if cfg.ref_guide <= 0 or cfg.edit_thr <= 0:
-            return False
-        s = float(torch.as_tensor(sigma).flatten()[0])
-        return cfg.edit_end * self.sigmas[0] <= s <= cfg.edit_start * self.sigmas[0]
-
-    def _remember(self, old, new):
-        return new if old is None else self.cfg.smooth * old + (1 - self.cfg.smooth) * new
-
-    def _distance_on(self):
-        cfg = self.cfg
-        return cfg.dist_calib > 0 or (cfg.dist_tau > 0 and cfg.ref_guide < 1)
-
-    def _distance_freedom(self, x0, ref, coverage, mask):
-        cfg = self.cfg
-        if not self._distance_on():
+        if cfg.dist_tau <= 0 or cfg.ref_guide >= 1:
             return 0.0
         if self.ref_std is None:
-            self.ref_std = ref[coverage.expand_as(ref) > 0].float().std()
+            self.ref_std = ref.float().std()
         d = token_rms(x0, ref) / self.ref_std
-        self.dist = self._remember(self.dist, blur(d, round(cfg.dist_blur * TOKEN)))
-        if cfg.dist_calib > 0:
-            outside = ((mask > 0.5) & (coverage > 0)).expand_as(self.dist)
-            background = self.dist[outside] if outside.any() else self.dist[(coverage > 0).expand_as(self.dist)]
-            tau = cfg.dist_calib * torch.quantile(background.float(), 0.9).clamp(min=1e-3)
-        else:
-            tau = cfg.dist_tau * cfg.ref_guide / (1 - cfg.ref_guide)
-        free = self.dist.pow(cfg.dist_pow) / (self.dist.pow(cfg.dist_pow) + tau ** cfg.dist_pow)
-        if cfg.free_latch:
-            self.free_max = free if self.free_max is None else torch.maximum(self.free_max, free)
-            free = self.free_max
-        if cfg.free_grow > 0:
-            free = _grow(free, cfg.free_grow)
-        return free
+        self.dist = d if self.dist is None else cfg.smooth * self.dist + (1 - cfg.smooth) * d
+        tau = cfg.dist_tau * cfg.ref_guide / (1 - cfg.ref_guide)
+        return self.dist.pow(cfg.dist_pow) / (self.dist.pow(cfg.dist_pow) + tau ** cfg.dist_pow)
 
-    def _update_edit_map(self, cond_x0, uncond_x0, mask):
-        e = token_rms(cond_x0, uncond_x0)
-        region = (mask < 0.5).expand_as(e)
-        if self.cfg.edit_region_norm and region.any():
-            scale = torch.stack([torch.quantile(b[r], self.cfg.edit_q) for b, r in zip(e, region)])
-        else:
-            scale = torch.quantile(e.flatten(1), self.cfg.edit_q, dim=1)
-        e = (e / (scale.view(-1, 1, 1, 1) + 1e-6)).clamp(0, 1)
-        self.edit_ema = self._remember(self.edit_ema, e)
-        self.edit_acc = self.edit_ema if self.edit_acc is None else torch.maximum(self.edit_acc, self.edit_ema)
-
-    def apply(self, sigma, x0, ref, mask, coverage, cond_x0=None, uncond_x0=None):
-        """x0, ref: (B, C, H, W); mask, coverage: (1, 1, H, W) in 0..1. cond_x0 / uncond_x0 feed the edit map."""
-        cfg = self.cfg
+    def apply(self, sigma, x0, ref, mask):
+        """x0, ref: (B, C, H, W); mask: (1, 1, H, W) in 0..1, 1 = keep as the source, 0 = edit area."""
         i = self.step_of(sigma)
         early, late = self.plan[i]
         hold = self.hold[i]
         if early == 0 and late == 0 and hold == 0:
             return x0
-        if self.needs_uncond(sigma) and cond_x0 is not None and uncond_x0 is not None:
-            self._update_edit_map(cond_x0, uncond_x0, mask)
-        free = self._distance_freedom(x0, ref, coverage, mask) if late > 0 else 0.0
-        if self.edit_acc is not None:
-            edit = _smoothstep((self.edit_acc - (cfg.edit_thr - cfg.edit_soft / 2)) / cfg.edit_soft)
-            if cfg.edit_grow > 0:
-                edit = _grow(edit, cfg.edit_grow)
-            free = free * edit if cfg.gate_and and self._distance_on() else 1 - (1 - free) * (1 - edit)
-        outside = mask
-        if cfg.gate_in_mask:
-            free = free * (1 - mask) ** cfg.gate_gamma
-        mask = cfg.inside + (1 - cfg.inside) * mask
-        if cfg.early_outside:
-            w = blur(mask * late * (1 - free) + outside * early + (1 - outside) * hold, round(cfg.feather * min(x0.shape[-2:]))) * coverage
-        else:
-            w = blur(mask * (early + late * (1 - free)), round(cfg.feather * min(x0.shape[-2:]))) * coverage
-        if cfg.debug:
-            self._debug(i, sigma, w)
+        free = self._distance_freedom(x0, ref) * (1 - mask) if late > 0 else 0.0
+        w = late * (1 - free) + mask * early + (1 - mask) * hold
         return torch.lerp(x0, ref.to(x0.dtype), w.to(x0.dtype))
 
 
-def add_guidance(m, cfg, reference, mask):
-    """Install reference guidance on a patched model. `reference(H, W, mask)` yields (reference latent,
-    coverage, mask weight) on the H x W target grid, or None when the reference is not aligned."""
+def add_guidance(m, cfg, source, mask):
+    """Install the source hold on a patched model. `source` is the source latent (scaled like the target), `mask` the
+    hold weight on the pixel grid (1 = keep as the source)."""
     run = {}   # state of the current sampling call; dropped when it ends
 
     def sample(executor, guider, sigmas, *args):
         run["guide"] = Guide(cfg, sigmas)
-        run["cfg1"] = math.isclose(guider.cfg, 1.0)
         run["placed"] = {}
         try:
             return executor(guider, sigmas, *args)
@@ -461,32 +396,12 @@ def add_guidance(m, cfg, reference, mask):
         x0 = _to_4d(denoised)
         size = tuple(x0.shape[-2:])
         if size not in run["placed"]:
-            placed = reference(*size, mask)
-            if placed is None:
-                print("[krea2edit] WARNING: reference guidance needs ref_position_a 'aligned'; it is off.", flush=True)
-            run["placed"][size] = placed if placed is None else tuple(t.to(x0.device) for t in placed)
-        placed = run["placed"][size]
-        if placed is None:
-            return denoised
-        ref, coverage, weight = placed
-        cond = uncond = None
-        if guide.needs_uncond(args["sigma"]) and args["uncond"] is not None:
-            cond, uncond = _to_4d(args["cond_denoised"]), _to_4d(args["uncond_denoised"])
-        out = guide.apply(args["sigma"], x0, ref[:1].expand(x0.shape[0], -1, -1, -1), weight, coverage, cond, uncond)
+            run["placed"][size] = tuple(t.to(x0.device) for t in _place_ref(source, mask, *size))
+        ref, weight = run["placed"][size]
+        out = guide.apply(args["sigma"], x0, ref[:1].expand(x0.shape[0], -1, -1, -1), weight)
         return out.reshape(denoised.shape)
 
-    def calc_cond(args):
-        # the unconditional pass is forced for the whole run (disable_cfg1_optimization); drop it again
-        # where the edit map does not need it and CFG is 1, which then returns the conditional prediction
-        conds = args["conds"]
-        guide = run.get("guide")
-        if guide is not None and run["cfg1"] and not guide.needs_uncond(args["sigma"]):
-            conds = [conds[0], None]
-        return comfy.samplers.calc_cond_batch(args["model"], conds, args["input"], args["sigma"], args["model_options"])
-
-    m.set_model_sampler_post_cfg_function(post_cfg, disable_cfg1_optimization=cfg.edit_thr > 0)
-    if cfg.edit_thr > 0:
-        m.set_model_sampler_calc_cond_batch_function(calc_cond)
+    m.set_model_sampler_post_cfg_function(post_cfg)
     comfy.patcher_extension.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, "krea2_edit_advanced_guide", sample, m.model_options, is_model_options=True)
 
@@ -498,27 +413,37 @@ class Krea2EditAdvanced(io.ComfyNode):
             node_id="Krea2EditAdvanced",
             display_name="Krea2 Edit Advanced (source patch)",
             category="krea2edit",
-            description="Adds the krea2_edit in-context source-preservation path (source latent as frame=1 tokens) to a Krea2 model.",
+            description="Lets a Krea 2 edit model see the source picture(s) while it draws and holds the picture to the source where the edit should not change it.",
             inputs=[
                 io.Model.Input("model"),
-                io.Latent.Input("source_latent_a", tooltip="1st reference (the scene in two-image workflows, or the only image) -> RoPE frame=1. All *_a inputs control this reference"),
-                io.Latent.Input("source_latent_b", optional=True, tooltip="2nd reference (the person) for multi-ref LoRAs -> RoPE frame=2, training-matched order: a first, b second. All *_b inputs control this reference"),
-                io.Float.Input("ref_boost_a", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="reference-fidelity dial for reference a: multiplies target->reference attention. 1.0 = off, >1 pulls harder toward the reference's appearance, <1 loosens. Optimal value is model-specific"),
-                io.Float.Input("ref_boost_b", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="same dial for reference b. No effect without a b reference. 1.0 = off"),
-                io.Mask.Input("ref_boost_mask_a", optional=True, tooltip="optional region on reference a to boost, e.g. the face. Draw it on the same image you connect as reference a (any resolution); it follows the crop/resize the reference goes through. Gray values scale the boost proportionally (0 = no boost, 1 = full). Empty = whole reference"),
-                io.Mask.Input("ref_boost_mask_b", optional=True, tooltip="same for reference b: drawn on the image you connect as reference b; gray values scale ref_boost_b proportionally. Empty = whole reference"),
-                io.Combo.Input("ref_position_a", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="where reference a sits in position space. aligned (trained) = pinned onto the output layout, how the models were trained (default). beside = placed next to the canvas: identity still flows but the layout pin is gone, so the content can be restaged more freely. bag of features = experimental, content without layout"),
-                io.Combo.Input("ref_position_b", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="the same choice for reference b; no effect without a b reference. For putting a person into a scene: a (scene) aligned + b (person) beside"),
+                io.Latent.Input("source_latent_a", tooltip="The source picture, encoded with VAE Encode. The model sees it while it draws, and source_hold pulls the picture back to it. It must be the same size as the picture being drawn (the latent you give the sampler): otherwise it is cropped to the shape of the output and resized in latent space, which loses parts of the image and softens details, and with source_hold the softened version is pulled into the result. Scale the image to the output size before VAE Encode, or use the encoded source as the sampler's latent."),
+                io.Latent.Input("source_latent_b", optional=True, tooltip="Optional second source picture, for example a person to put into the scene. The model sees it next to source A; the source hold does not use it. Needs a LoRA trained for two sources."),
+                io.Float.Input("ref_boost_a", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="How closely the drawing follows the look of source A. 1 = normal. Higher = sticks closer to the source's details (too high copies the source and weakens the edit), lower = looser. Applies to all of source A, or only to the part marked in ref_boost_mask_a."),
+                io.Float.Input("ref_boost_b", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="The same for source B. No effect without source B. 1 = normal."),
+                io.Mask.Input("ref_boost_mask_a", optional=True, tooltip="Limits ref_boost_a to a part of source A, for example the face: white = full boost, black = none, gray = partly. Draw it on the source image, any resolution. Empty = the whole source."),
+                io.Mask.Input("ref_boost_mask_b", optional=True, tooltip="The same for source B and ref_boost_b."),
+                io.DynamicCombo.Input("ref_position_a", tooltip="How source A is shown to the model. aligned (trained) = laid exactly over the picture being drawn, the way the models were trained; the source hold and edit mask need it. beside = placed next to the picture: the look carries over but the layout is free, so things can be rearranged. bag of features = experimental, the look without any layout.", options=[
+                    io.DynamicCombo.Option(REF_POSITIONS[0], [
+                        io.Boolean.Input("source_hold", default=True, tooltip="Pulls the picture back towards source A while it is drawn, wherever the edit should not change it. Off = no pull, the model alone decides, which can shift the picture by a pixel or two and darken it. If you plan several edits in a row, pass the output latent of one step as the source of the next. Works on the whole picture."),
+                        io.Float.Input("hold_strength", default=0.7, min=0.0, max=10.0, step=0.05, tooltip="How firmly the edit area stays close to source A early in the drawing, while the layout forms. The edit area is the white part of edit_mask, or the whole picture when there is no mask; outside the mask the source is always held firmly. Higher = steadier picture (less shift, darkening or texture change) but smaller, more source-bound edits; lower = more freedom for the edit. 0.7 is a balance. At 0.5 the picture still drifts noticeably; at 4 added objects come out about half as big. 0 = no extra hold in the edit area."),
+                        io.Mask.Input("edit_mask", optional=True, tooltip="Where the picture may change: white = edit area, black = keep as the source, gray = partly. Draw it on the source image, any resolution. Without a mask the whole picture is the edit area. Krea 2 does not use the mask to choose where objects appear, so say where in the prompt. Best workflow: run once without a mask to see where Krea 2 puts the object, then draw the mask there and run again."),
+                        io.Float.Input("grow_percent", default=0.0, min=-100.0, max=100.0, step=0.5, tooltip="Makes the white area of edit_mask (where the edit may change the picture) bigger (positive) or smaller (negative) all around its edge, in percent of the shorter side of the picture. 0 = the mask as drawn."),
+                        io.Float.Input("feather_percent", default=0.0, min=0.0, max=100.0, step=0.5, tooltip="Softens the edge of the white area of edit_mask, in percent of the shorter side of the picture, after growing or shrinking. 0 = hard edge."),
+                    ]),
+                    io.DynamicCombo.Option(REF_POSITIONS[1], []),
+                    io.DynamicCombo.Option(REF_POSITIONS[2], []),
+                ]),
+                io.Combo.Input("ref_position_b", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="The same choice for source B; no effect without source B. To put a person into a scene: A (the scene) aligned, B (the person) beside."),
             ],
-            outputs=[io.Model.Output()],
+            outputs=[io.Model.Output(), io.Mask.Output(tooltip="edit_mask as the node uses it, after growing and feathering (white = where the edit may change the picture; all white without edit_mask).")],
         )
 
     @classmethod
-    def execute(cls, model, source_latent_a, source_latent_b=None, ref_boost_a=1.0, ref_boost_b=1.0,
-                ref_boost_mask_a=None, ref_boost_mask_b=None, ref_position_a="aligned (trained)",
-                ref_position_b="aligned (trained)"):
-        if not (ref_position_a.startswith("aligned") and ref_position_b.startswith("aligned")):
-            print(f"[krea2edit] reference placement: a={ref_position_a!r}, "
+    def execute(cls, model, source_latent_a, ref_position_a, source_latent_b=None, ref_boost_a=1.0, ref_boost_b=1.0,
+                ref_boost_mask_a=None, ref_boost_mask_b=None, ref_position_b="aligned (trained)"):
+        position_a = ref_position_a["ref_position_a"]
+        if not (position_a.startswith("aligned") and ref_position_b.startswith("aligned")):
+            print(f"[krea2edit] reference placement: a={position_a!r}, "
                   f"b={ref_position_b!r}", flush=True)
         m = model.clone()
         # The target latent reaches the diffusion model already scaled (process_latent_in);
@@ -526,6 +451,9 @@ class Krea2EditAdvanced(io.ComfyNode):
         src = model.model.process_latent_in(source_latent_a["samples"])
         if source_latent_b is not None:
             src = [src, model.model.process_latent_in(source_latent_b["samples"])]
+
+        source_size = tuple(_to_4d(source_latent_a["samples"]).shape[-2:])
+        warned = []
 
         def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
             # ComfyUI signature drift (2026-07-19, commit c9602625 adds ref_latents):
@@ -541,16 +469,25 @@ class Krea2EditAdvanced(io.ComfyNode):
                         transformer_options = a
                         break
             dm = executor.class_obj  # the SingleStreamDiT instance
+            if not warned and tuple(_to_4d(x).shape[-2:]) != source_size:
+                warned.append(True)
+                print(f"[krea2edit] WARNING: source_latent_a is {source_size[1] * 8}x{source_size[0] * 8}px but the picture is drawn at "
+                      f"{x.shape[-1] * 8}x{x.shape[-2] * 8}px: the source is cropped and resized in latent space, which softens it. "
+                      f"Scale the image to the output size before VAE Encode.", flush=True)
             return krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
                                       ref_boost_a=ref_boost_a, ref_boost_b=ref_boost_b,
                                       ref_boost_mask_a=ref_boost_mask_a, ref_boost_mask_b=ref_boost_mask_b,
-                                      ref_position_a=ref_position_a, ref_position_b=ref_position_b)
+                                      ref_position_a=position_a, ref_position_b=ref_position_b)
 
         to = m.model_options.setdefault("transformer_options", {})
         comfy.patcher_extension.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit_advanced", wrapper, to
         )
-        return io.NodeOutput(m)
+        h, w = _to_4d(source_latent_a["samples"]).shape[-2:]
+        edit = _edit_mask(ref_position_a.get("edit_mask"), (h * 8, w * 8), ref_position_a.get("grow_percent", 0.0), ref_position_a.get("feather_percent", 0.0))
+        if ref_position_a.get("source_hold"):
+            add_guidance(m, GuideConfig(early_hold=ref_position_a["hold_strength"]), src[0] if isinstance(src, list) else src, 1 - edit)
+        return io.NodeOutput(m, edit)
 
 
 class Krea2EditAdvancedGroundedEncode(io.ComfyNode):
@@ -573,13 +510,6 @@ class Krea2EditAdvancedGroundedEncode(io.ComfyNode):
         "texture, quantity, text, spatial relationships of the objects and background:"
     )
 
-    KREA2_EDIT_TEMPLATE = (
-        "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
-        "texture, quantity, text, spatial relationships of the objects and background:"
-        "<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-        "{}<|im_end|>\n<|im_start|>assistant\n"
-    )
-
     @classmethod
     def _template(cls, nimg, system_prompt=""):
         sp = system_prompt.strip() or cls.DEFAULT_SYSTEM
@@ -593,25 +523,17 @@ class Krea2EditAdvancedGroundedEncode(io.ComfyNode):
             node_id="Krea2EditAdvancedGroundedEncode",
             display_name="Krea2 Edit Advanced (grounded encode)",
             category="krea2edit",
-            description="Encodes the edit instruction grounded on the source image (training-matched semantic path).",
+            description="Encodes the instruction together with the source picture, the way the edit models were trained, so the text can refer to what is in the picture.",
             inputs=[
                 io.Clip.Input("clip"),
-                io.String.Input("prompt", multiline=True, default=""),
-                io.Image.Input("image_a", optional=True, tooltip="1st reference (the scene, or the only image) — the image you encode into source_latent_a"),
-                io.Image.Input("image_b", optional=True, tooltip="2nd reference (the person) for multi-ref LoRAs; vision blocks in training order: a, b"),
-                io.Int.Input("grounding_px", default=768, min=0, max=4096, step=64, optional=True, tooltip="cap longest side fed to Qwen3-VL; 0 = native"),
-                io.String.Input("system_prompt", multiline=True, default="", optional=True, tooltip="advanced (optional): override the grounding system prompt (empty = training default). Steers what the vision encoder attends to, e.g. facial identity detail."),
+                io.String.Input("prompt", multiline=True, default="", tooltip="What to change. Krea 2 Edit does not use the mask to place things, so say where the new object goes; long prompts are fine. Leave empty on the negative encode."),
+                io.Image.Input("image_a", optional=True, tooltip="The source picture, the one you encode into source_latent_a. Connect the same picture to the negative encode as well."),
+                io.Image.Input("image_b", optional=True, tooltip="Optional second source picture, the same one you encode into source_latent_b."),
+                io.Int.Input("grounding_px", default=768, min=0, max=4096, step=64, optional=True, tooltip="Longest side, in pixels, of the picture the text encoder looks at; larger pictures are scaled down for it only, not for the output. 0 = full size. 640-768 matches the training."),
+                io.String.Input("system_prompt", multiline=True, default="", optional=True, tooltip="Optional. Replaces the instruction that tells the text encoder what to look at (empty = the one the models were trained with), for example to stress facial detail."),
             ],
             outputs=[io.Conditioning.Output()],
         )
-
-    KREA2_EDIT_TEMPLATE_2REF = (
-        "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
-        "texture, quantity, text, spatial relationships of the objects and background:"
-        "<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-        "<|vision_start|><|image_pad|><|vision_end|>"
-        "{}<|im_end|>\n<|im_start|>assistant\n"
-    )
 
     @classmethod
     def _prep(cls, image, grounding_px):
@@ -642,18 +564,3 @@ class Krea2EditExtension(ComfyExtension):
 
 async def comfy_entrypoint():
     return Krea2EditExtension()
-
-
-def _pack_version():
-    # single source of truth = pyproject.toml, so this never drifts from the release
-    try:
-        import os, re
-        p = os.path.join(os.path.dirname(__file__), "pyproject.toml")
-        with open(p) as f:
-            m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
-        return m.group(1) if m else "unknown"
-    except Exception:
-        return "unknown"
-
-
-print(f"[krea2edit] nodes v{_pack_version()} loaded", flush=True)

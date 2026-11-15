@@ -55,3 +55,10 @@ def _run_steps(wrapper, n=3, h=64, w=64):
             original=lambda *a, **k: None, class_obj=object(), wrappers=[wrapper], idx=0,
         )
         executor.execute(torch.zeros(1, 4, h, w), None, None, None, {})
+
+
+def _node(mod, model, source_latent_a, ref_position_a="aligned (trained)", **kw):
+    """Run the patch node with a plain position string; the hold stays off unless a dict (the dynamic combo value) is given."""
+    if isinstance(ref_position_a, str):
+        ref_position_a = {"ref_position_a": ref_position_a, **({"source_hold": False} if ref_position_a.startswith("aligned") else {})}
+    return mod.Krea2EditAdvanced.execute(model, source_latent_a, ref_position_a, **kw)

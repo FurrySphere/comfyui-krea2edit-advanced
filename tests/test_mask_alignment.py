@@ -23,7 +23,7 @@ if _HERE not in sys.path:
 
 import comfy.patcher_extension as pe                                          # noqa: E402
 
-from stubs import _FakeModelPatcher, _load_pack           # noqa: E402
+from stubs import _FakeModelPatcher, _load_pack, _node           # noqa: E402
 from test_ref_controls import TXT, _FakeDiT                                   # noqa: E402
 
 BOOST = 3.0
@@ -64,7 +64,7 @@ def _image(ih, iw, rect):
 def _run(mod, H, W, ref_index=0, **patch_kw):
     """Run the real forward through the wrapper; returns (content of ref tokens, boost map of ref tokens)."""
     dm = _RecordingDiT()
-    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), **patch_kw)
+    m, _ = _node(mod, _FakeModelPatcher(), **patch_kw)
     wrapper = m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
     ex = pe.WrapperExecutor(original=lambda *a, **k: None, class_obj=dm, wrappers=[wrapper], idx=0)
     ex.execute(torch.zeros(1, 4, H, W), torch.tensor([0.5]), torch.zeros(1, TXT, 8), None, {})

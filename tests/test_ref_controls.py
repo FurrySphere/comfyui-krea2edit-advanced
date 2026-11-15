@@ -18,7 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from stubs import _FakeModelPatcher, _load_pack, _run_steps   # noqa: E402
+from stubs import _FakeModelPatcher, _load_pack, _node, _run_steps   # noqa: E402
 
 TXT, GRID, TOK = 3, 8, 64          # text tokens; target/ref grid (patch 2 on a 16x16 latent); tokens per image
 LOG = math.log
@@ -84,9 +84,8 @@ def _ref_pos(m, i):
 def test_input_names_are_a_b_symmetric():
     mod = _load_pack()
     it = mod.Krea2EditAdvanced.INPUT_TYPES()
-    assert list(it["required"]) == ["model", "source_latent_a"]
-    assert list(it["optional"]) == [
-        "source_latent_b", "ref_boost_a", "ref_boost_b", "ref_boost_mask_a", "ref_boost_mask_b", "ref_position_a", "ref_position_b"]
+    assert list(it["required"]) == ["model", "source_latent_a", "ref_position_a"]
+    assert list(it["optional"]) == ["source_latent_b", "ref_boost_a", "ref_boost_b", "ref_boost_mask_a", "ref_boost_mask_b", "ref_position_b"]
     names = list(it["required"]) + list(it["optional"])
     for n in names:
         if n.endswith("_b"):
@@ -329,7 +328,7 @@ def _capture(mod):
 
 def _wrapper(mod, latent_a, **kw):
     import comfy.patcher_extension as pe
-    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), {"samples": latent_a}, **kw)
+    m, _ = _node(mod, _FakeModelPatcher(), {"samples": latent_a}, **kw)
     return m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
 
 

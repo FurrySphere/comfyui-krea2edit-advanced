@@ -25,15 +25,22 @@ from test_ref_controls import TXT, _FakeCLIP, _FakeDiT, _src, _top_half_mask   #
 POSITIONS = ["aligned (trained)", "beside (right of target)", "bag of features"]
 FLOAT_BOOST = {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001}
 
+HOLD_INPUTS = {          # the inputs that only exist while reference a is aligned (the dynamic combo option)
+    "source_hold": ("required", "BOOLEAN", {"default": True}),
+    "hold_strength": ("required", "FLOAT", {"default": 0.7, "min": 0.0, "max": 10.0, "step": 0.05}),
+    "grow_percent": ("required", "FLOAT", {"default": 0.0, "min": -100.0, "max": 100.0, "step": 0.5}),
+    "feather_percent": ("required", "FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.5}),
+    "edit_mask": ("optional", "MASK", {}),
+}
 PATCH_INPUTS = {          # name -> (group, type, options without the tooltip), in declaration order
     "model": ("required", "MODEL", {}),
     "source_latent_a": ("required", "LATENT", {}),
+    "ref_position_a": ("required", {POSITIONS[0]: HOLD_INPUTS, POSITIONS[1]: {}, POSITIONS[2]: {}}, {}),
     "source_latent_b": ("optional", "LATENT", {}),
     "ref_boost_a": ("optional", "FLOAT", FLOAT_BOOST),
     "ref_boost_b": ("optional", "FLOAT", FLOAT_BOOST),
     "ref_boost_mask_a": ("optional", "MASK", {}),
     "ref_boost_mask_b": ("optional", "MASK", {}),
-    "ref_position_a": ("optional", POSITIONS, {"default": POSITIONS[0]}),
     "ref_position_b": ("optional", POSITIONS, {"default": POSITIONS[0]}),
 }
 ENCODE_INPUTS = {
@@ -58,17 +65,24 @@ SNAPSHOT = {
 }
 
 
-def _contract(cls):
+def _group(inputs):
+    """{name: (group, type, options without the tooltip)}; a combo is its option list, a dynamic combo {option key: its inputs}."""
     out = {}
     for group in ("required", "optional"):
-        for name, spec in cls.INPUT_TYPES().get(group, {}).items():
+        for name, spec in inputs.get(group, {}).items():
             typ, opts = spec[0], (dict(spec[1]) if len(spec) > 1 else {})
             opts.pop("tooltip", None)
             if typ == "COMBO":                      # V3 reports a combo as COMBO plus its options; V1 had the option list as the type
                 typ = list(opts.pop("options"))
                 opts.pop("multiselect")
+            elif typ == "COMFY_DYNAMICCOMBO_V3":
+                typ = {o["key"]: _group(o["inputs"]) for o in opts.pop("options")}
             out[name] = (group, typ, opts)
     return out
+
+
+def _contract(cls):
+    return _group(cls.INPUT_TYPES())
 
 
 def _snapshot(mod, srcs, x=None, **kw):
@@ -108,7 +122,7 @@ def test_patch_node_inputs_are_frozen():
     assert list(_contract(mod.Krea2EditAdvanced)) == list(PATCH_INPUTS)           # order = socket order = widget order
     schema = mod.Krea2EditAdvanced.GET_SCHEMA()
     assert (schema.node_id, schema.display_name, schema.category) == ("Krea2EditAdvanced", "Krea2 Edit Advanced (source patch)", "krea2edit")
-    assert list(mod.Krea2EditAdvanced.RETURN_TYPES) == ["MODEL"]
+    assert list(mod.Krea2EditAdvanced.RETURN_TYPES) == ["MODEL", "MASK"]
 
 
 def test_encode_node_inputs_are_frozen():
@@ -126,14 +140,20 @@ def test_the_extension_lists_both_nodes():
     assert nodes == [mod.Krea2EditAdvanced, mod.Krea2EditAdvancedGroundedEncode]
 
 
+def _tooltips(inputs):
+    for group in ("required", "optional"):
+        for name, spec in inputs.get(group, {}).items():
+            if name not in ("model", "clip"):
+                assert len(spec) > 1 and spec[1].get("tooltip"), f"{name} has no tooltip"
+            if spec[0] == "COMFY_DYNAMICCOMBO_V3":
+                for option in spec[1]["options"]:
+                    _tooltips(option["inputs"])
+
+
 def test_every_input_has_a_tooltip():
     mod = _load_pack()
-    missing = {"prompt"}        # the grounded encode prompt has none yet; the description rewrite removes this exemption
     for cls in (mod.Krea2EditAdvanced, mod.Krea2EditAdvancedGroundedEncode):
-        for group in ("required", "optional"):
-            for name, spec in cls.INPUT_TYPES().get(group, {}).items():
-                if name not in ("model", "clip") and name not in missing:
-                    assert len(spec) > 1 and spec[1].get("tooltip"), f"{cls.__name__}.{name} has no tooltip"
+        _tooltips(cls.INPUT_TYPES())
 
 
 # ---------------------------------------------------------------- what the forward builds
@@ -141,6 +161,14 @@ def test_every_input_has_a_tooltip():
 def test_forward_snapshot_matches_the_frozen_table():
     mod = _load_pack()
     assert _snapshots(mod) == SNAPSHOT
+
+
+def test_patchify_orders_tokens_by_position_and_channels_by_pixel():
+    mod = _load_pack()
+    x = torch.arange(2 * 3 * 4 * 6, dtype=torch.float32).reshape(2, 3, 4, 6)
+    tokens = mod._patchify(x, 2)
+    assert tokens.shape == (2, 2 * 3, 3 * 2 * 2)
+    assert torch.equal(tokens[1, 4], x[1, :, 2:4, 2:4].flatten())            # token (row 1, column 1), channels then pixel rows then columns
 
 
 def test_batch_and_temporal_targets_keep_their_shape():
