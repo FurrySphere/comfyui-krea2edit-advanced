@@ -419,7 +419,7 @@
           "link": 2
         },
         {
-          "name": "source_latent",
+          "name": "source_latent_a",
           "type": "LATENT",
           "link": 15
         },
@@ -430,7 +430,7 @@
           "link": 21
         },
         {
-          "name": "ref_boost_mask",
+          "name": "ref_boost_mask_a",
           "shape": 7,
           "type": "MASK",
           "link": null
@@ -442,7 +442,7 @@
           "link": 16
         },
         {
-          "name": "source_image",
+          "name": "source_image_a",
           "shape": 7,
           "type": "IMAGE",
           "link": 14
@@ -474,7 +474,7 @@
       },
       "widgets_values": [
         4,
-        1,
+        4,
         "fit"
       ]
     },
@@ -594,7 +594,7 @@
           "link": 4
         },
         {
-          "name": "image",
+          "name": "image_a",
           "shape": 7,
           "type": "IMAGE",
           "link": 12
@@ -647,7 +647,7 @@
           "link": 5
         },
         {
-          "name": "image",
+          "name": "image_a",
           "shape": 7,
           "type": "IMAGE",
           "link": 13
@@ -889,7 +889,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "THE FIDELITY DIAL (ref_boost) - how hard the model looks at your\nreference. New in this release.\n\n  1.0 = classic v1.1 behavior\n  4.0 = recommended (pre-set): much stronger face + body likeness,\n        more reliable edits\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a: the scene dial (image 1) in two-image mode -\nleave at 1.0 unless you are exploring. ref_boost applies to the\nperson (image 2) when group 2 is enabled, else to your image.\n\nfit_mode: how inputs fit a different output aspect\nratio. fit = resample to the output shape (default, recommended); crop (legacy) = center-crop\nonly for v1/v1.1 weights."
+        "THE FIDELITY DIAL (ref_boost_a / ref_boost_b) - how hard the model looks at your\nreference. New in this release.\n\n  1.0 = classic v1.1 behavior\n  4.0 = recommended (pre-set): much stronger face + body likeness,\n        more reliable edits\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a is the dial for image 1 (your image / the scene), ref_boost_b\nfor image 2 (the person, group 2). Both ship at 4.0; in two-image mode\nset ref_boost_a back to 1.0 unless you are exploring.\n\nfit_mode: how inputs fit a different output aspect\nratio. fit = resample to the output shape (default, recommended); crop (legacy) = center-crop\nonly for v1/v1.1 weights."
       ],
       "color": "#432",
       "bgcolor": "#653"

@@ -167,7 +167,7 @@ def test_target_latent_encodes_before_sampling():
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
-    wrapper = _patch(mod, vae=vae, source_image=_image(), target_latent=_latent())
+    wrapper = _patch(mod, vae=vae, source_image_a=_image(), target_latent=_latent())
 
     assert len(vae.calls) == 1, "source should be encoded during patch(), not later"
 
@@ -182,7 +182,7 @@ def test_without_target_latent_encode_lands_in_the_wrapper():
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
-    wrapper = _patch(mod, vae=vae, source_image=_image())
+    wrapper = _patch(mod, vae=vae, source_image_a=_image())
 
     assert vae.calls == [], "nothing to encode yet without a known target resolution"
 
@@ -195,7 +195,7 @@ def test_both_references_are_pre_encoded():
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
-    wrapper = _patch(mod, vae=vae, source_image=_image(), source_image_b=_image(),
+    wrapper = _patch(mod, vae=vae, source_image_a=_image(), source_image_b=_image(),
                      target_latent=_latent())
 
     assert len(vae.calls) == 2, "scene and subject refs both pre-encoded"
@@ -212,7 +212,7 @@ def test_mismatched_target_latent_falls_back_correctly():
     seen = []
     _stub_forward(mod, seen)
     vae = _FakeVAE()
-    wrapper = _patch(mod, vae=vae, source_image=_image(), target_latent=_latent(32, 32))
+    wrapper = _patch(mod, vae=vae, source_image_a=_image(), target_latent=_latent(32, 32))
 
     assert len(vae.calls) == 1                    # primed at the wrong size
 
@@ -222,7 +222,7 @@ def test_mismatched_target_latent_falls_back_correctly():
 
 
 def test_target_latent_without_pixel_path_is_inert():
-    """No vae/source_image means the latent path — target_latent must change nothing."""
+    """No vae/source_image_a means the latent path — target_latent must change nothing."""
     mod = _load_pack()
     seen = []
     _stub_forward(mod, seen)

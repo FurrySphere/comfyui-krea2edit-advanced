@@ -4,6 +4,61 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## Unreleased — consistent `_a` / `_b` input naming (breaking for saved workflows)
+
+Every per-reference input now has an `_a` (first reference: the image being edited / the scene,
+RoPE frame 1) and a `_b` (second reference: the person, RoPE frame 2) form, and each suffix always
+acts on its own reference. Controls no longer change owner depending on how many references are connected.
+
+### Changed
+- `Krea2EditModelPatch`: `source_latent` → `source_latent_a`, `source_image` → `source_image_a`,
+  `ref_boost` → `ref_boost_a`, `ref_boost_a` → `ref_boost_b`, `ref_position` → `ref_position_a`,
+  `ref_position_a` → `ref_position_b`, `ref_boost_mask` → `ref_boost_mask_a`.
+  **Single-image workflows keep their values** (the old unsuffixed controls drove the only image, now `_a`).
+  **Two-image workflows must re-check the person's values:** the old unsuffixed controls drove the
+  person and are now `_b` — see the table below.
+- `Krea2EditGroundedEncode`: `image` → `image_a`.
+- A workflow that still sends an old input name (`source_latent`, `source_image`, `image`, `ref_boost`,
+  `ref_boost_mask`, `ref_position`) now fails with an error naming the new input, instead of running
+  with the references silently dropped.
+- A `_b` control without a `_b` reference is simply ignored (an unused `ref_boost_b` no longer builds an attention bias).
+- Widget order is `ref_boost_a`, `ref_boost_b`, `fit_mode`, `ref_position_a`, `ref_position_b`, so saved
+  single-image workflows keep their boost and position values on the only image.
+
+### Added
+- `source_latent_a` is now optional when `vae` + `source_image_a` are connected, so the pixel path no
+  longer needs a separately VAE-encoded latent. In that mode the latent inputs are not read at all
+  (previously they were still passed through `process_latent_in` and discarded). With neither
+  connected the node raises a clear error.
+- `ref_boost_mask_b`: a boost region for the second reference (previously the one mask could only target the last reference).
+
+### Fixed
+- **Boost masks now follow the reference's crop/resize.** The mask used to be squeezed onto the
+  reference token grid as-is, but the reference had already been center-cropped or letterboxed
+  to the target, so the boost landed on the wrong content whenever the source's aspect ratio
+  differed from the output (most visible with `crop (legacy)` and on the latent path, ~15 px with
+  `fit`). The mask is now cropped to the same window as its image (or latent) before use, and may
+  have any resolution.
+- A 2D `ref_boost_mask` was mis-shaped before resampling.
+
+### Changed (behavior)
+- **Boost masks are proportional.** Previously a mask was thresholded at 0.5 per token (all or
+  nothing). A token whose mask value is `m` now gets the attention weight `1 + m × (boost − 1)`,
+  so soft/feathered masks blend the boost in and gray below 0.5 is no longer dropped. Binary
+  masks behave as before.
+
+| Before (two references) | Now |
+|---|---|
+| `ref_boost` (person) | `ref_boost_b` |
+| `ref_boost_a` (scene) | `ref_boost_a` |
+| `ref_position` (person) | `ref_position_b` |
+| `ref_position_a` (scene) | `ref_position_a` |
+| `ref_boost_mask` (person) | `ref_boost_mask_b` |
+
+Renamed sockets lose their links in workflows saved with the old names; reconnect them. The shipped
+workflow is updated; it sets both boosts to 4.0, so set `ref_boost_a` back to 1.0 when enabling the
+two-image group.
+
 ## v2.0.0 — Krea 2 Identity Edit V2 + Krea 2 General Edit V2
 
 V2 ships as two LoRAs (weights on Hugging Face):

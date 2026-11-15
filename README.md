@@ -14,7 +14,7 @@ into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was t
 **V2 (recommended)** ships as two LoRAs — **Krea 2 Identity Edit V2**
 (`krea2_identity_edit_v2.safetensors`, restage a person from one photo) and **Krea 2 General
 Edit V2** (`krea2_general_edit_v2.safetensors`, instruction-based editing). Use one per task.
-The V2 nodes add **reference placement** (`ref_position` / `ref_position_a`). Older weights
+The V2 nodes add **reference placement** (`ref_position_a` / `ref_position_b`). Older weights
 keep working with these nodes. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
@@ -36,12 +36,21 @@ No extra Python dependencies.
 Wraps the diffusion model so the VAE-encoded source image is prepended as clean
 in-context tokens (RoPE frame 1). Inputs:
 - `model` — Krea 2 (LoRA already applied)
-- `source_latent` — VAEEncode of the image being edited
-- `source_latent_b` *(optional)* — second reference (RoPE frame 2) for two-input
-  edits (e.g. person + scene)
-- `vae` + `source_image` *(optional, recommended)* — the blur-proof pixel path: give
+
+Every input comes in an **`_a` / `_b` pair**: `_a` always controls the first reference (the
+image being edited, or the scene in two-image edits; RoPE frame 1) and `_b` always controls the
+second (the person; RoPE frame 2). Which controls apply never depends on how many references are
+connected: with a single reference only the `_a` inputs matter and the `_b` ones are ignored.
+
+- `source_latent_a` *(optional)* — VAEEncode of the image being edited. Not needed when `vae` +
+  `source_image_a` are connected (the pixel path below): the latent inputs are then ignored entirely
+  and the working resolution comes from `target_latent` or the sampled latent. Without the pixel
+  path it is required.
+- `source_latent_b` *(optional)* — second reference for two-input edits (e.g. person + scene)
+- `vae` + `source_image_a` *(optional, recommended)* — the blur-proof pixel path: give
   the raw image (and VAE) and the node fits it to the target grid in pixel space.
-  Required for `fit_mode: fit`.
+  Required for `fit_mode: fit`. `source_image_b` is the second reference as an image; when this
+  path is active the images replace the latent inputs entirely.
 - `target_latent` *(optional, recommended whenever you use the pixel path)* — wire the
   **same** latent you feed `KSampler.latent_image`. It only tells the node the output
   resolution ahead of time, so the source can be VAE-encoded here instead of on the first
@@ -49,21 +58,26 @@ in-context tokens (RoPE frame 1). Inputs:
 - `fit_mode` *(default `fit`)* — how a source fits a mismatched output aspect ratio.
   `fit` = training-matched resample at a centered offset (v1.2); `crop` = center-crop,
   the v1/v1.1-legacy geometry (use with older weights).
-- `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
-  reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
-- `ref_position` *(default `aligned (trained)`)* — where the **last** reference (the person,
-  or the only image) sits in position space. `aligned` pins it onto the output layout (how the
-  models were trained); `beside (right of target)` places it next to the canvas, so identity
-  still flows but the layout pin is gone and the person can be restaged more freely;
-  `bag of features` is experimental. `ref_position_a` is the same choice for the **first**
-  reference (the scene). For putting a person into a scene: scene `aligned`, person `beside`.
+- `ref_boost_a` / `ref_boost_b` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward
+  the reference's appearance, <1 loosens.
+- `ref_boost_mask_a` / `ref_boost_mask_b` *(optional)* — restrict that reference's boost to a
+  region of it, e.g. the face. Draw the mask on the same image you connect as that reference, at
+  any resolution: the node applies the same crop/resize to the mask that the reference goes
+  through, so it stays on the right content. Gray values scale the boost proportionally (0 = none,
+  1 = full, 0.5 = halfway in attention-weight terms: weight `1 + mask × (boost − 1)`). The
+  mask is averaged over each 16×16 px token, so its effective resolution is that grid.
+- `ref_position_a` / `ref_position_b` *(default `aligned (trained)`)* — where the reference sits
+  in position space. `aligned` pins it onto the output layout (how the models were trained);
+  `beside (right of target)` places it next to the canvas, so identity still flows but the layout
+  pin is gone and the person can be restaged more freely; `bag of features` is experimental.
+  For putting a person into a scene: `_a` (scene) `aligned`, `_b` (person) `beside`.
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while
 reading your instruction, exactly as during training. Inputs:
 - `clip` — the Krea 2 CLIP (Qwen3-VL, loaded with `type: krea2`)
 - `prompt` — the edit instruction ("recolor the car to matte black")
-- `image` — the same source image
+- `image_a` — the same source image as `source_image_a`
 - `image_b` *(optional)* — second reference for two-input edits
 - `grounding_px` — grounding resolution (default 768; v1.2 trained range
   384–768, and 1024+ often still works nicely). This is a quality dial: lower =
@@ -77,14 +91,14 @@ instructions ("the man on the left").
 ## Minimal wiring
 
 ```
-LoadImage ─┬─ VAEEncode ── Krea2EditModelPatch.source_latent
-           └─ Krea2EditGroundedEncode.image     (+ your prompt)
+LoadImage ─┬─ VAEEncode ── Krea2EditModelPatch.source_latent_a
+           └─ Krea2EditGroundedEncode.image_a   (+ your prompt)
 UNETLoader ── LoraLoaderModelOnly (krea2_identity_edit_v1_2 @1.0) ── Krea2EditModelPatch.model
 Krea2EditModelPatch ── KSampler.model
 Krea2EditGroundedEncode ── KSampler.positive
 Krea2EditGroundedEncode (empty prompt, same image) ── KSampler.negative
 EmptySD3LatentImage ─┬─ KSampler.latent_image
-                     └─ Krea2EditModelPatch.target_latent   (when using vae + source_image)
+                     └─ Krea2EditModelPatch.target_latent   (when using vae + source_image_a)
 ```
 
 Example workflow in `workflows/`: `krea2_identity_edit.json` — single-image editor by
@@ -92,7 +106,7 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
 
 ## Usage notes (read these — they matter)
 
-1. **Aspect ratio.** With `fit_mode: fit` (default in v1.2) and `vae` + `source_image`
+1. **Aspect ratio.** With `fit_mode: fit` (default in v1.2) and `vae` + `source_image_a`
    connected, mismatched source/output aspect ratios are handled — the source is
    resampled to the target grid. On `crop`/legacy weights, still match the AR: a
    mismatched AR is out of distribution and degrades identity/preservation.
@@ -103,7 +117,7 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    usually re-render the subject instead of removing it.
 4. At CFG > 1, ground the negative too: a second `Krea2EditGroundedEncode` with an
    empty prompt and the same image (this is the trained unconditional).
-5. Two-input edits: scene image → `source_latent`/`image`, subject image →
+5. Two-input edits: scene image → `source_latent_a`/`image_a`, subject image →
    `source_latent_b`/`image_b`. Leave the b-inputs unconnected for single-image use.
 6. **Generate at ≤2MP.** Above the trained range, source content can bleed into
    the output or subjects duplicate.
@@ -111,7 +125,7 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    the main inputs, subject B on the `_b` inputs) rather than adding them one at a time —
    simultaneous placement is currently more reliable than chaining separate edits. Face
    separation is still imperfect and a focus for future versions.
-8. **Wire `target_latent` if you use `vae` + `source_image`** — see below.
+8. **Wire `target_latent` if you use `vae` + `source_image_a`** — see below.
 
 ## Pixel path and VRAM
 
@@ -143,7 +157,7 @@ only show up across many steps. A 1-step run is almost entirely fixed overhead (
 load, text encode, VAE encode/decode) and will show no difference at all.
 
 A third option is to skip the pixel path entirely: resize your source image to exactly
-the output resolution and feed only `source_latent`. At matched resolution the latent
+the output resolution and feed only `source_latent_a`. At matched resolution the latent
 path does no resampling and produces the same reference geometry.
 
 ## License / credits
