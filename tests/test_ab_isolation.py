@@ -2,13 +2,12 @@
 
 Complements test_ref_controls.py: instead of asserting expected values, these tests perturb
 only one side and require the other side to be byte-identical, then check the routing
-from node inputs to the forward pass and the shipped workflow's wiring.
+from node inputs to the forward pass.
 
 Run standalone:  python tests/test_ab_isolation.py
 Or via pytest:   pytest tests/test_ab_isolation.py
 """
 import inspect
-import json
 import os
 import sys
 
@@ -22,7 +21,6 @@ from stubs import _FakeModelPatcher, _latent, _load_pack, _run_steps   # noqa: E
 from test_ref_controls import (BESIDE, TOK, TXT, _FakeCLIP, _capture, _forward, _img,   # noqa: E402
                                _src, _val, _wrapper)
 
-PACK = os.path.dirname(_HERE)
 BAG = "bag of features"
 
 
@@ -146,47 +144,6 @@ def test_every_b_input_is_optional_and_unneeded():
     assert torch.is_tensor(seen[-1][0])
     tokens = mod.Krea2EditAdvancedGroundedEncode.execute(_FakeCLIP(), "p", image_a=_img(0.25, 64))[0]
     assert len(tokens["images"]) == 1
-
-
-# ---------------------------------------------------------------- shipped workflow wiring
-
-def _root_image(links, nodes, node_id, input_name):
-    """Walk an input back through VAEEncode/pixel links to the LoadImage that feeds it."""
-    node = nodes[node_id]
-    inp = next(i for i in node["inputs"] if i["name"] == input_name)
-    while True:
-        link = next(l for l in links if l[0] == inp["link"])
-        node = nodes[link[1]]
-        if node["type"] == "LoadImage":
-            return node["id"]
-        inp = next(i for i in node["inputs"] if i["type"] == "IMAGE")
-
-
-def test_shipped_workflow_wires_a_and_b_to_their_own_image():
-    with open(os.path.join(PACK, "workflows", "krea2_identity_edit.json"), encoding="utf-8") as f:
-        wf = json.load(f)
-    nodes = {n["id"]: n for n in wf["nodes"]}
-    links = wf["links"]
-    patch = next(n for n in wf["nodes"] if n["type"] == "Krea2EditAdvanced")
-    encoders = [n for n in wf["nodes"] if n["type"] == "Krea2EditAdvancedGroundedEncode"]
-
-    roots = {}
-    for name in ("source_latent_a", "source_latent_b"):
-        roots[name] = _root_image(links, nodes, patch["id"], name)
-    for enc in encoders:
-        roots[f"enc{enc['id']}.image_a"] = _root_image(links, nodes, enc["id"], "image_a")
-        roots[f"enc{enc['id']}.image_b"] = _root_image(links, nodes, enc["id"], "image_b")
-
-    a = {v for k, v in roots.items() if k.endswith("_a") or k.endswith(".image_a")}
-    b = {v for k, v in roots.items() if k.endswith("_b") or k.endswith(".image_b")}
-    assert len(a) == 1 and len(b) == 1 and a != b, roots
-    # group 2 (the `b` image) ships bypassed, group 1 does not
-    assert nodes[a.pop()].get("mode", 0) == 0 and nodes[b.pop()].get("mode", 0) == 4
-
-    names = {i["name"] for i in patch["inputs"]}
-    assert not names & {"source_latent", "source_image", "ref_boost_mask", "ref_boost", "ref_position"}
-    assert patch["widgets_values"][:2] == [4, 4]
-    assert all(i["name"] != "image" for e in encoders for i in e["inputs"])
 
 
 if __name__ == "__main__":

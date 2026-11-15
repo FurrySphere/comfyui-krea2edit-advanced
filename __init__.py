@@ -1,4 +1,6 @@
-"""ComfyUI-Krea2Edit — in-context edit forward for the Krea2 model.
+"""ComfyUI-Krea2Edit-Advanced — in-context edit forward for the Krea2 model.
+
+Modified from comfyui-krea2edit by Conrad Locke (Apache-2.0), see NOTICE.
 
 ComfyUI's native Krea2 `_forward` is text-to-image only: it builds the sequence
 `[text | target]`. The krea2_edit LoRA (trained in ai-toolkit) needs the *appearance

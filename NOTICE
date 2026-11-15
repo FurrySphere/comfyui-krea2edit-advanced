@@ -1,0 +1,10 @@
+Krea 2 Edit Advanced (comfyui-krea2edit-advanced)
+
+This project is a fork of comfyui-krea2edit (https://github.com/lbouaraba/comfyui-krea2edit)
+by Conrad Locke (lbouaraba), licensed under the Apache License, Version 2.0.
+The Krea 2 Edit LoRA weights and the training code are separate works of the original author.
+
+Modifications in this fork (the V3 nodes under new ids, the source hold, the edit mask and the
+removal of the pixel path) are made by FurrySphere (https://github.com/FurrySphere) and are
+licensed under the same Apache License, Version 2.0. See CHANGELOG.md and the git history for what
+changed.

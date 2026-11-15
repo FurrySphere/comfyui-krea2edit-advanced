@@ -1,10 +1,41 @@
-# Changelog — Krea 2 Identity Edit
+# Changelog — Krea 2 Edit Advanced
 
-Weights: https://huggingface.co/conradlocke/krea2-identity-edit
-v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
-weights via `fit_mode: crop`.
+This fork continues the version numbers of [comfyui-krea2edit](https://github.com/lbouaraba/comfyui-krea2edit),
+which ended at v2.0.0. Everything from "Before 3.0.0" down is the history of the original project plus one
+change made in this fork before 3.0.0, and uses the original node names. LoRA weights:
+https://huggingface.co/conradlocke/krea2-identity-edit
 
-## Unreleased — consistent `_a` / `_b` input naming (breaking for saved workflows)
+## 3.0.0 — Krea2 Edit Advanced: source hold and edit mask (breaking)
+
+The package is renamed to `comfyui-krea2edit-advanced`. The nodes moved to the V3 schema under new ids, so they
+can be installed next to the original pack: `Krea2EditAdvanced` ("Krea2 Edit Advanced (source patch)") replaces
+`Krea2EditModelPatch`, and `Krea2EditAdvancedGroundedEncode` ("Krea2 Edit Advanced (grounded encode)") replaces
+`Krea2EditGroundedEncode`. Workflows saved with the original nodes must be reconnected.
+
+### Added
+- **Source hold** (`source_hold`, `hold_strength`, `edit_mask`, `grow_percent`, `feather_percent`, available under
+  `ref_position_a = aligned (trained)`): pulls the picture back to the source while it is drawn, so edits no
+  longer shift or darken the rest of the picture, also over chains of edits. The edit mask limits where the
+  picture may change; the grown (or shrunk) and feathered mask is returned as a `MASK` output.
+- A warning when `source_latent_a` has another size than the sampled latent.
+
+### Changed
+- `ref_position_a` is a dynamic combo: the hold inputs appear under `aligned (trained)`. The other options show
+  no extra inputs. `ref_boost_a/b`, `ref_boost_mask_a/b`, `ref_position_b` and the grounded encode inputs keep
+  their meaning.
+- Every input has a description in plain words, with the area it acts on.
+- The example workflow is replaced by two examples: `krea2_edit_advanced_api.json` (one edit) and
+  `krea2_edit_advanced_chain_api.json` (six edits with the latent pass). Both scale and center-crop the image to the
+  output size before VAE Encode and use the default boosts (1.0).
+
+### Removed
+- The pixel path: `vae`, `source_image_a`, `source_image_b`, `target_latent` and `fit_mode`. The source is a
+  latent only; scale the image to the output size before VAE Encode.
+- The error for workflows that still use the pre-`_a`/`_b` input names.
+- `node.zip` (a stale packaged copy of the original nodes), the original's funding file and its example workflow
+  `krea2_identity_edit.json`.
+
+## Before 3.0.0 (this fork, original node names) — consistent `_a` / `_b` input naming (breaking for saved workflows)
 
 Every per-reference input now has an `_a` (first reference: the image being edited / the scene,
 RoPE frame 1) and a `_b` (second reference: the person, RoPE frame 2) form, and each suffix always
@@ -56,8 +87,7 @@ acts on its own reference. Controls no longer change owner depending on how many
 | `ref_boost_mask` (person) | `ref_boost_mask_b` |
 
 Renamed sockets lose their links in workflows saved with the old names; reconnect them. The shipped
-workflow is updated; it sets both boosts to 4.0, so set `ref_boost_a` back to 1.0 when enabling the
-two-image group.
+workflow of that time set both boosts to 4.0; the current one uses the defaults.
 
 ## v2.0.0 — Krea 2 Identity Edit V2 + Krea 2 General Edit V2
 

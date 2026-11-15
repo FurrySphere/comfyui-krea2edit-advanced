@@ -1,0 +1,240 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "krea2_turbo_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "Krea 2 model"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+      "type": "krea2",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Text encoder"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "_meta": {
+      "title": "VAE"
+    }
+  },
+  "4": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "Krea2/krea2_general_edit_v2.safetensors",
+      "strength_model": 1.0
+    },
+    "_meta": {
+      "title": "Krea 2 Edit LoRA"
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    },
+    "_meta": {
+      "title": "Image to edit"
+    }
+  },
+  "6": {
+    "class_type": "ResolutionSelector",
+    "inputs": {
+      "aspect_ratio": "2:3 (Portrait Photo)",
+      "megapixels": 1.0,
+      "multiple": 8
+    },
+    "_meta": {
+      "title": "Output size"
+    }
+  },
+  "7": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "5",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": [
+        "6",
+        0
+      ],
+      "height": [
+        "6",
+        1
+      ],
+      "crop": "center"
+    },
+    "_meta": {
+      "title": "Scale and center-crop to the output size"
+    }
+  },
+  "8": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "7",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Encode the source"
+    }
+  },
+  "9": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": [
+        "6",
+        0
+      ],
+      "height": [
+        "6",
+        1
+      ],
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Output size"
+    }
+  },
+  "10": {
+    "class_type": "Krea2EditAdvanced",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "source_latent_a": [
+        "8",
+        0
+      ],
+      "ref_boost_a": 1.0,
+      "ref_position_a": "aligned (trained)",
+      "ref_position_a.source_hold": true,
+      "ref_position_a.hold_strength": 0.7,
+      "ref_position_a.grow_percent": 0.0,
+      "ref_position_a.feather_percent": 0.0
+    },
+    "_meta": {
+      "title": "Source patch"
+    }
+  },
+  "11": {
+    "class_type": "Krea2EditAdvancedGroundedEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "prompt": "Relight the scene with warm golden hour sunlight.",
+      "image_a": [
+        "7",
+        0
+      ],
+      "grounding_px": 768,
+      "system_prompt": ""
+    },
+    "_meta": {
+      "title": "Prompt"
+    }
+  },
+  "12": {
+    "class_type": "Krea2EditAdvancedGroundedEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "prompt": "",
+      "image_a": [
+        "7",
+        0
+      ],
+      "grounding_px": 768,
+      "system_prompt": ""
+    },
+    "_meta": {
+      "title": "Empty negative"
+    }
+  },
+  "13": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "10",
+        0
+      ],
+      "positive": [
+        "11",
+        0
+      ],
+      "negative": [
+        "12",
+        0
+      ],
+      "latent_image": [
+        "9",
+        0
+      ],
+      "seed": 42,
+      "steps": 8,
+      "cfg": 1.0,
+      "sampler_name": "er_sde",
+      "scheduler": "beta",
+      "denoise": 1.0
+    },
+    "_meta": {
+      "title": "Sampler"
+    }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "13",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Decode"
+    }
+  },
+  "15": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "14",
+        0
+      ],
+      "filename_prefix": "krea2_edit_advanced/edit"
+    },
+    "_meta": {
+      "title": "Result"
+    }
+  }
+}
