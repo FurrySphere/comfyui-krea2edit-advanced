@@ -18,18 +18,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from test_pre_encode import _FakeModelPatcher, _load_pack, _run_steps   # noqa: E402
+from stubs import _FakeModelPatcher, _load_pack, _run_steps   # noqa: E402
 
 TXT, GRID, TOK = 3, 8, 64          # text tokens; target/ref grid (patch 2 on a 16x16 latent); tokens per image
 LOG = math.log
-
-
-class _ValueVAE:
-    """Encodes an image to a latent filled with the image's (constant) pixel value."""
-
-    def encode(self, pixels):
-        b, h, w, _ = pixels.shape
-        return torch.full((b, 4, h // 8, w // 8), float(pixels.mean()))
 
 
 class _FakeDiT:
@@ -91,25 +83,14 @@ def _ref_pos(m, i):
 
 def test_input_names_are_a_b_symmetric():
     mod = _load_pack()
-    it = mod.Krea2EditModelPatch.INPUT_TYPES()
-    assert list(it["required"]) == ["model"]
+    it = mod.Krea2EditAdvanced.INPUT_TYPES()
+    assert list(it["required"]) == ["model", "source_latent_a"]
     assert list(it["optional"]) == [
-        "source_latent_a", "source_latent_b", "ref_boost_a", "ref_boost_b", "fit_mode", "ref_boost_mask_a", "ref_boost_mask_b",
-        "vae", "source_image_a", "source_image_b", "target_latent", "ref_position_a", "ref_position_b"]
+        "source_latent_b", "ref_boost_a", "ref_boost_b", "ref_boost_mask_a", "ref_boost_mask_b", "ref_position_a", "ref_position_b"]
     names = list(it["required"]) + list(it["optional"])
     for n in names:
         if n.endswith("_b"):
             assert n[:-1] + "a" in names, f"{n} has no _a counterpart"
-
-
-def test_widget_order_matches_single_ref_workflows_saved_before_the_rename():
-    """Widgets serialize positionally. Old order was [ref_boost, ref_boost_a, fit_mode, ref_position,
-    ref_position_a]; in single-ref workflows slot 0/3 controlled the only image, which is now `a`."""
-    mod = _load_pack()
-    it = mod.Krea2EditModelPatch.INPUT_TYPES()
-    widgets = [n for n, spec in it["optional"].items()
-               if spec[0] in ("FLOAT", "INT", "STRING") or isinstance(spec[0], list)]
-    assert widgets == ["ref_boost_a", "ref_boost_b", "fit_mode", "ref_position_a", "ref_position_b"]
 
 
 # ---------------------------------------------------------------- sequence layout
@@ -348,8 +329,8 @@ def _capture(mod):
 
 def _wrapper(mod, latent_a, **kw):
     import comfy.patcher_extension as pe
-    (m,) = mod.Krea2EditModelPatch().patch(_FakeModelPatcher(), {"samples": latent_a}, **kw)
-    return m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit"][0]
+    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), {"samples": latent_a}, **kw)
+    return m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
 
 
 def _img(v, px=512):
@@ -371,41 +352,6 @@ def test_latent_path_single_and_pair():
     assert [_val(s) for s in src] == [1.0, 2.0]
 
 
-def test_pixel_path_replaces_latents_entirely():
-    mod = _load_pack()
-    seen = _capture(mod)
-    w = _wrapper(mod, _src(1), source_latent_b={"samples": _src(2)}, vae=_ValueVAE(),
-                 source_image_a=_img(0.25), source_image_b=_img(0.5))
-    _run_steps(w, n=1)
-    assert [_val(s) for s in seen[-1][0]] == [0.25, 0.5]
-
-
-def test_pixel_path_without_second_image_drops_the_second_latent():
-    mod = _load_pack()
-    seen = _capture(mod)
-    w = _wrapper(mod, _src(1), source_latent_b={"samples": _src(2)}, vae=_ValueVAE(),
-                 source_image_a=_img(0.25))
-    _run_steps(w, n=1)
-    src = seen[-1][0]
-    assert torch.is_tensor(src) and _val(src) == 0.25
-
-
-def test_second_image_without_first_image_is_ignored():
-    mod = _load_pack()
-    seen = _capture(mod)
-    w = _wrapper(mod, _src(1), source_latent_b={"samples": _src(2)}, vae=_ValueVAE(),
-                 source_image_b=_img(0.5))
-    _run_steps(w, n=1)
-    assert [_val(s) for s in seen[-1][0]] == [1.0, 2.0]
-
-
-def test_images_without_vae_use_the_latent_path():
-    mod = _load_pack()
-    seen = _capture(mod)
-    _run_steps(_wrapper(mod, _src(1), source_image_a=_img(0.25)), n=1)
-    assert _val(seen[-1][0]) == 1.0
-
-
 def test_controls_are_forwarded_unchanged():
     mod = _load_pack()
     seen = _capture(mod)
@@ -419,21 +365,6 @@ def test_controls_are_forwarded_unchanged():
     assert (k["ref_position_a"], k["ref_position_b"]) == (BESIDE, "bag of features")
 
 
-def test_fit_geometry_flags_follow_pixel_path_and_fit_mode():
-    mod = _load_pack()
-    seen = _capture(mod)
-    pix = dict(vae=_ValueVAE(), source_image_a=_img(0.25))
-    for kw, native, pos in (
-            (dict(**pix, fit_mode="fit"), True, "stride1"),
-            (dict(**pix, fit_mode="crop (legacy)"), False, "anchor"),
-            (dict(fit_mode="fit"), False, "stride1")):          # no pixel path: pos_mode still follows fit_mode
-        _run_steps(_wrapper(mod, _src(1), **kw), n=1)
-        k = seen[-1][1]
-        assert (k["ref_native"], k["pos_mode"]) == (native, pos), kw.keys()
-
-
-# ---------------------------------------------------------------- Krea2EditGroundedEncode: image_a / image_b
-
 class _FakeCLIP:
     def tokenize(self, prompt, **kw):
         return {"prompt": prompt, **kw}
@@ -443,12 +374,12 @@ class _FakeCLIP:
 
 
 def _encode(mod, **kw):
-    return mod.Krea2EditGroundedEncode().encode(_FakeCLIP(), "edit it", **kw)[0]
+    return mod.Krea2EditAdvancedGroundedEncode.execute(_FakeCLIP(), "edit it", **kw)[0]
 
 
 def test_encode_inputs_follow_the_a_b_naming():
     mod = _load_pack()
-    it = mod.Krea2EditGroundedEncode.INPUT_TYPES()
+    it = mod.Krea2EditAdvancedGroundedEncode.INPUT_TYPES()
     assert list(it["optional"])[:2] == ["image_a", "image_b"]
 
 
@@ -479,32 +410,6 @@ def test_encode_grounding_px_caps_the_longest_side():
     assert capped.shape[1:3] == (256, 256)
     native = _encode(mod, image_a=_img(0.25, 1024), grounding_px=0)["images"][0]
     assert native.shape[1:3] == (1024, 1024)
-
-
-def test_old_input_names_fail_loudly_instead_of_dropping_the_references():
-    """A pre-rename workflow still sends these; the node must say so, not run without references."""
-    mod = _load_pack()
-    for old, new in (("source_latent", "source_latent_a"), ("source_image", "source_image_a"),
-                     ("ref_boost", "ref_boost_a"), ("ref_boost_mask", "ref_boost_mask_a"),
-                     ("ref_position", "ref_position_a")):
-        try:
-            _wrapper(mod, _src(1), **{old: 1})
-        except ValueError as e:
-            assert old in str(e) and new in str(e), str(e)
-        else:
-            raise AssertionError(f"{old} was silently accepted")
-    try:
-        mod.Krea2EditGroundedEncode().encode(_FakeCLIP(), "p", image=_img(0.25, 64), image_b=_img(0.5, 64))
-    except ValueError as e:
-        assert "image -> image_a" in str(e)
-    else:
-        raise AssertionError("old `image` input was silently accepted")
-
-
-def test_unknown_inputs_only_warn():
-    mod = _load_pack()
-    _capture(mod)
-    _wrapper(mod, _src(1), some_future_input=1)
 
 
 def _f32(x):

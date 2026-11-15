@@ -9,22 +9,25 @@ the sequence as `[text | source(frame=1) | target(frame=0)]`, keeping only the t
 out — mirroring ai-toolkit's `predict_velocity_edit` exactly, using the model's own submodules.
 
 Wiring:  LoadImage -> VAEEncode(source) --\
-                                            Krea2EditModelPatch(model, source_latent_a) -> KSampler
+                                            Krea2EditAdvanced(model, source_latent_a) -> KSampler
          UNETLoader -> LoraLoaderModelOnly -/
 KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
 """
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
 import comfy.patcher_extension
+import comfy.samplers
 import comfy.utils
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import apply_rope
 from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy_api.latest import ComfyExtension, io
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -33,34 +36,6 @@ def _imgids(bs, frame, h_, w_, device):
     ids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
     ids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
     return ids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
-
-
-def _imgids_offset(bs, frame, gh, gw, th, tw, device):
-    """Stride-1 integer positions at a centered integer offset. For `fit` refs the
-    pixels are already resampled to target grid density, so the position grid is
-    stride-1 BY CONSTRUCTION — scaling it again only manufactures skip/collision
-    artifacts. Requires gh<=th, gw<=tw (guaranteed by the floor+cap in fit)."""
-    # fractional center (2026-07-28): integer floor placed odd-gap refs 8px off
-    # their true center — RoPE is continuous, half-token positions are exact.
-    off_h, off_w = max(0.0, (th - gh) / 2), max(0.0, (tw - gw) / 2)
-    ids = torch.zeros(gh, gw, 3, device=device, dtype=torch.float32)
-    ids[..., 0] = frame
-    ids[..., 1] = (torch.arange(gh, device=device, dtype=torch.float32) + off_h)[:, None]
-    ids[..., 2] = (torch.arange(gw, device=device, dtype=torch.float32) + off_w)[None, :]
-    return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
-
-
-RENAMED_INPUTS = {"source_latent": "source_latent_a", "source_image": "source_image_a", "image": "image_a",
-                  "ref_boost": "ref_boost_a (one image) / ref_boost_b (two images)",
-                  "ref_boost_mask": "ref_boost_mask_a (one image) / ref_boost_mask_b (two images)",
-                  "ref_position": "ref_position_a (one image) / ref_position_b (two images)"}
-
-
-def _reject_renamed(inputs):
-    """A workflow saved before the _a/_b rename still sends the old names; ignoring them would silently drop the references."""
-    old = [f"{k} -> {RENAMED_INPUTS[k]}" for k in inputs if k in RENAMED_INPUTS]
-    if old:
-        raise ValueError("Krea2Edit inputs were renamed, reconnect them (see CHANGELOG.md): " + "; ".join(old))
 
 
 REF_POSITIONS = ["aligned (trained)", "beside (right of target)", "bag of features"]
@@ -100,43 +75,12 @@ def _to_4d(v):
     return v
 
 
-def _fit_box(ih, iw, px_h, px_w, fit_mode):
-    """Window of an ih x iw source that becomes the reference for a px_h x px_w target, and the size
-    it is resized to: (y0, x0, crop_h, crop_w, out_h, out_w). Reference images, source latents and
-    their boost masks all follow this one geometry."""
-    if fit_mode == "fit":
-        # "bilinear" answer to scale mismatch: resample CONTENT (pixel space, bicubic)
-        # to the target's grid density instead of moving positions. AR-preserving
-        # fit-inside, no crop, no grey canvas — the forward places it at an integer
-        # centered offset (scaled-pos with s=1 -> stride 1, no rounding artifacts).
-        sc = min(px_h / ih, px_w / iw)
-        # NEAR-MATCHED AR: fill the target grid EXACTLY via a minimal center-crop.
-        # Fit-inside margins of 1-2 tokens are not harmless: target edge columns
-        # with no ref correspondence get filled by repeating adjacent ref content
-        # (2026-07-14 edge-duplication bug: ref (74,54) vs target (74,56)).
-        # This also restores the design promise fit == crop at matched AR.
-        CROP_TOL = 0.08
-        if not (ih * sc >= px_h * (1 - CROP_TOL) and iw * sc >= px_w * (1 - CROP_TOL)):
-            # genuine AR mismatch: MUST match the trainer's _fit_prep EXACTLY
-            # (krea2_edit.py) — /16 floor snap capped at the target's /16 floor.
-            # The model is trained on this geometry; a /8-round node grid would
-            # produce a different ref latent size -> different centered offset ->
-            # a visible margin-boundary seam even from a well-trained model
-            # (train/infer geometry must be byte-identical). 2026-07-15 alignment.
-            nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
-            nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
-            # CROP-TO-GRID (2026-07-28 seam-doubling RCA): resizing ih*sc -> floor16
-            # SQUASHES content by up to 15px; the misregistration peaks exactly at
-            # the ref band edges — the outpaint seam — and renders as a doubled
-            # band (proven causal: 754px vs 753px input A/B, one pixel flips
-            # clean<->worst). Center-crop the source so the fitted axis lands on
-            # the /16 grid at scale sc EXACTLY: zero squash, stride-1 stays true.
-            ch, cw = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
-            return (ih - ch) // 2, (iw - cw) // 2, ch, cw, nh, nw
-    # crop (default / "v1 legacy", and fit at near-matched AR): center-crop to the target AR.
+def _fit_box(ih, iw, px_h, px_w):
+    """Window (y0, x0, h, w) of an ih x iw source that is cropped, centered, to the aspect ratio of a px_h x px_w target.
+    Source latents and their boost masks follow this one geometry."""
     s = max(px_h / ih, px_w / iw)
     ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
-    return (ih - ch) // 2, (iw - cw) // 2, ch, cw, px_h, px_w
+    return (ih - ch) // 2, (iw - cw) // 2, ch, cw
 
 
 def _crop_mask(mask, ih, iw, box):
@@ -149,14 +93,6 @@ def _crop_mask(mask, ih, iw, box):
     return mask[..., ya:yb, xa:xb]
 
 
-def _crop_mask_to_image(mask, image, H, W, fit_mode):
-    """The mask of a reference image, cropped to the part of the image _fit_encode_image keeps."""
-    if mask is None or image is None:
-        return mask
-    ih, iw = image.shape[1:3]
-    return _crop_mask(mask, ih, iw, _fit_box(ih, iw, H * 8, W * 8, fit_mode)[:4])
-
-
 def _fit_src(src, H, W):
     """Fit a source latent to the target grid the way TRAINING did: center-crop to
     the target aspect ratio, then resize. A plain interpolate (the pre-fix behavior)
@@ -165,26 +101,25 @@ def _fit_src(src, H, W):
     sh, sw = src.shape[-2:]
     if (sh, sw) == (H, W):
         return src
-    y0, x0, ch, cw, _, _ = _fit_box(sh, sw, H, W, "crop")
+    y0, x0, ch, cw = _fit_box(sh, sw, H, W)
     src = src[..., y0:y0 + ch, x0:x0 + cw]
     return F.interpolate(src.float(), size=(H, W), mode="bilinear")
 
 
-def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
-    """Pixel-space source prep (blur-proof path): crop and resize the IMAGE to the
-    target grid per _fit_box, VAE-encode. Latent-space resizing (the old fallback)
-    softens VAE latents — this path never resizes latents at all. Cached per target
-    resolution (encode once, not per step)."""
-    key = key + (fit_mode,)
-    if key in cache:
-        return cache[key]
-    print(f"[krea2edit] _fit_encode_image: mode={fit_mode} in={tuple(image.shape)} target_latent={H}x{W}", flush=True)
-    img = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
-    y0, x0, ch, cw, nh, nw = _fit_box(*img.shape[-2:], H * 8, W * 8, fit_mode)
-    img = F.interpolate(img[..., y0:y0 + ch, x0:x0 + cw].float(), size=(nh, nw), mode="bicubic", antialias=True)
-    lat = vae.encode(img.movedim(1, -1)[..., :3].clamp(0, 1))
-    cache[key] = lat
-    return lat
+def _place_ref(ref, mask, H, W):
+    """Reference a on the target's latent grid: padded to whole tokens and fitted like krea2_edit_forward fits a
+    source. Returns the reference, its coverage and its mask weight (the MASK drawn on the reference, 1 without one),
+    cropped to H x W."""
+    Hp, Wp = -(-H // TOKEN) * TOKEN, -(-W // TOKEN) * TOKEN
+    ref = comfy.ldm.common_dit.pad_to_patch_size(_to_4d(ref), (TOKEN, TOKEN), padding_mode="replicate")
+    if ref.shape[-2:] != (Hp, Wp):
+        if mask is not None:
+            mask = _crop_mask(mask, *ref.shape[-2:], _fit_box(*ref.shape[-2:], Hp, Wp))
+        ref = _fit_src(ref, Hp, Wp)
+    weight = ref.new_ones(1, 1, Hp, Wp)
+    if mask is not None:
+        weight = F.interpolate((mask if mask.ndim == 3 else mask[None])[:1][None].float(), size=(Hp, Wp), mode="area")
+    return ref[..., :H, :W], ref.new_ones(1, 1, H, W), weight[..., :H, :W]
 
 
 def _ref_attn_bias(boosts, masks, txtlen, slens, tgtlen, mask_hw, device, dtype):
@@ -217,8 +152,7 @@ def _ref_attn_bias(boosts, masks, txtlen, slens, tgtlen, mask_hw, device, dtype)
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost_a=1.0, ref_boost_b=1.0, ref_boost_mask_a=None, ref_boost_mask_b=None,
-                       ref_native=False, pos_mode="anchor", ref_position_a="aligned (trained)",
-                       ref_position_b="aligned (trained)"):
+                       ref_position_a="aligned (trained)", ref_position_b="aligned (trained)"):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -250,11 +184,11 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
         src = _to_4d(sl).to(x.device, x.dtype)
         if src.shape[0] != bs:
             src = src[:1].expand(bs, *src.shape[1:])
-        if not ref_native and src.shape[-2:] != (H, W):
+        if src.shape[-2:] != (H, W):
             print(f"[krea2edit] LATENT-PATH fit_src (crop): src={tuple(src.shape[-2:])} -> {H}x{W}", flush=True)
             sh, sw = src.shape[-2:]
             if masks[i] is not None:
-                masks[i] = _crop_mask(masks[i], sh, sw, _fit_box(sh, sw, H, W, "crop")[:4])
+                masks[i] = _crop_mask(masks[i], sh, sw, _fit_box(sh, sw, H, W))
             src = _fit_src(src, H, W).to(x.dtype)
         srcs.append(comfy.ldm.common_dit.pad_to_patch_size(src, (patch, patch), padding_mode="replicate"))
     src_grids = [(s_.shape[-2] // patch, s_.shape[-1] // patch) for s_ in srcs]
@@ -276,12 +210,7 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     combined = torch.cat([context] + src_imgs + [tgt_img], dim=1)  # [text | refs... | target]
 
     device = combined.device
-    if pos_mode == "stride1" and ref_native:
-        print(f"[krea2edit] STRIDE1-POS fit: ref grids {src_grids} centered in ({h_},{w_})", flush=True)
-        ref_ids = [_imgids_offset(bs, i + 1, gh, gw, h_, w_, device)
-                   for i, (gh, gw) in enumerate(src_grids)]
-    else:
-        ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
+    ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
     ref_ids = _place_refs(ref_ids, [ref_position_a, ref_position_b][:len(ref_ids)], h_, w_)
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]   # text @ 0
@@ -310,97 +239,293 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     return out
 
 
-class Krea2EditModelPatch:
+# ---------------------------------------------------------------------------------------------------------
+# Reference guidance: pull the denoised estimate toward the aligned reference latent.
+#
+# At every step the sampler's x0 estimate is blended toward the reference, x0' = x0 + w * (ref - x0). This is
+# the same update as blending the velocity toward the reference's straight-line velocity (RF-Inversion's
+# controller guidance). Output preservation is decided by the late steps, layout by the early ones, so the
+# schedule has two phases split at `crossover * sigma_start`. Two optional gates let the model deviate where
+# it clearly wants to:
+# - distance gate (late phase): tokens whose estimate is far from the reference are left alone;
+# - edit-map gate: tokens where the instruction changes the prediction (cond vs uncond) are left alone.
+# ---------------------------------------------------------------------------------------------------------
+TOKEN = 2  # latent cells per token side (patch size)
+
+
+@dataclass
+class GuideConfig:
+    ref_guide: float = 0.0     # pull strength 0..1; 0 = off, 1 = copy the reference where the mask allows
+    crossover: float = 0.5     # early phase = sigma above crossover * sigma_start
+    late_gain: float = 1.0     # late-phase strength = min(1, late_gain * ref_guide); 0 = early phase only
+    early_gain: float = 1.0    # early-phase strength = early_gain * ref_guide; 0 = late phase only
+    early_decay: float = 0.0   # LAB: the early pull falls with sigma as ((sigma - crossover * sigma0) / (sigma0 - crossover * sigma0)) ** early_decay; 0 = constant
+    early_hold: float = 0.0    # LAB: with early_outside, the early pull where the mask is 0 (everywhere without a mask) peaks at min(X, 1) and falls with sigma with exponent 2 / X; 0 = off
+    dist_tau: float = 0.0      # distance-gate tolerance in reference-std units; 0 = off
+    dist_calib: float = 0.0    # LAB: tolerance = dist_calib * the 90th percentile of the distance outside the mask; 0 = use dist_tau
+    dist_pow: float = 2.0      # LAB: steepness n of the gate d^n / (d^n + tol^n)
+    dist_blur: float = 0.0     # LAB: blur of the distance map, in tokens
+    free_latch: bool = False   # LAB: a token the gate has freed stays free for the rest of the late phase
+    free_grow: int = 0         # LAB: the freed region grows by this many tokens (then softens by one token)
+    edit_thr: float = 0.0      # edit-map threshold in (0, 1); 0 = off
+    edit_start: float = 0.9    # edit map is estimated for sigma in [edit_end, edit_start] * sigma_start
+    edit_end: float = 0.5
+    edit_soft: float = 0.3     # LAB: width of the smoothstep around the edit threshold
+    edit_q: float = 0.95       # LAB: the edit map is normalised by this quantile of its values
+    edit_grow: int = 0         # LAB: the region the edit map frees grows by this many tokens
+    edit_region_norm: bool = False  # LAB: the edit map is normalised over the masked region (mask < 0.5) instead of the whole image
+    gate_and: bool = False     # LAB: a token is freed only when the distance gate AND the edit gate agree (default: either)
+    gate_gamma: float = 1.0    # LAB: with gate_in_mask the freedom is scaled by (1 - mask) ** gate_gamma
+    early_outside: bool = False  # LAB: the early-phase pull ignores the inside floor, i.e. is zero where the mask is 0
+    inside: float = 0.0       # pull where the mask is 0, as a fraction of the pull where it is 1 (linear in between)
+    gate_in_mask: bool = False  # the gates free tokens only where the mask is 0; where it is 1 the pull is unconditional
+    feather: float = 0.0       # blur radius of the weight map, as a fraction of the latent side
+    smooth: float = 0.5        # across-step memory of the gate maps (0 = none)
+    debug: bool = False        # LAB ONLY: print gate statistics and dump the maps as PNGs under output/guide_lab_debug
+
+
+def step_weights(sigmas, ref_guide, crossover, late_gain, early_gain=1.0, early_decay=0.0):
+    """Per step (early, late) weights. A step that straddles the crossover is split by its share of the
+    pull (1 - sigma_next / sigma), so the total early pull does not depend on the step count."""
+    sigmas = [float(s) for s in sigmas]
+    sigma_c = crossover * sigmas[0]
+    late = min(1.0, late_gain * ref_guide)
+    plan = []
+    for s, sn in zip(sigmas[:-1], sigmas[1:]):
+        f = min(1.0, max(0.0, (1 - sigma_c / s) / (1 - sn / s))) if s > sigma_c else 0.0
+        fall = ((s - sigma_c) / (sigmas[0] - sigma_c)) ** early_decay if s > sigma_c and sigmas[0] > sigma_c else 1.0
+        plan.append((early_gain * ref_guide * f * fall, late * (1 - f)))
+    return plan
+
+
+def token_rms(a, b):
+    """RMS over channels of a - b, averaged over each token, back at latent-cell resolution."""
+    sq = (a - b).float().pow(2).mean(1, keepdim=True)
+    sq = F.avg_pool2d(sq, TOKEN, ceil_mode=True)
+    return F.interpolate(sq, size=a.shape[-2:], mode="nearest").sqrt()
+
+
+def blur(m, radius):
+    if radius < 1:
+        return m
+    return F.avg_pool2d(F.pad(m, (radius,) * 4, mode="replicate"), 2 * radius + 1, stride=1)
+
+
+def _grow(m, tokens):
+    """Grow a map by `tokens` tokens (max filter), then soften it by one token."""
+    r = tokens * TOKEN
+    return blur(F.max_pool2d(m, 2 * r + 1, stride=1, padding=r), TOKEN)
+
+
+def _smoothstep(x):
+    x = x.clamp(0, 1)
+    return x * x * (3 - 2 * x)
+
+
+class Guide:
+    """State of one sampling run. Build a new one per run."""
+
+    def __init__(self, cfg, sigmas):
+        self.cfg = cfg
+        self.sigmas = [float(s) for s in sigmas]
+        self.plan = step_weights(self.sigmas, cfg.ref_guide, cfg.crossover, cfg.late_gain, cfg.early_gain, cfg.early_decay)
+        self.hold = [e for e, _ in step_weights(self.sigmas, cfg.ref_guide, cfg.crossover, cfg.late_gain, min(cfg.early_hold, 1.0), 2.0 / cfg.early_hold)] if cfg.early_hold > 0 else [0.0] * len(self.plan)
+        self.ref_std = None
+        self.dist = None
+        self.free_max = None
+        self.edit_ema = None
+        self.edit_acc = None
+        self.tag = None
+
+    def _debug(self, i, sigma, w):
+        """LAB ONLY (remove with the lab node): per-step statistics and maps."""
+        import os
+        import time
+        from PIL import Image
+        self.tag = self.tag or time.strftime("%H%M%S")
+        quant = lambda t: " ".join(f"{float(v):.2f}" for v in torch.quantile(t.flatten().float(), torch.tensor([0.1, 0.5, 0.9, 0.99], device=t.device)))
+        line = f"[krea2edit] guide step {i + 1}/{len(self.plan)} sigma {float(torch.as_tensor(sigma).flatten()[0]):.3f} early {self.plan[i][0]:.2f} late {self.plan[i][1]:.2f} | pull q10/50/90/99 {quant(w)}"
+        maps = {"pull": w}
+        if self.dist is not None:
+            line += f" | dist {quant(self.dist)}"
+            maps["dist"] = self.dist / 2
+        if self.edit_acc is not None:
+            line += f" | edit {quant(self.edit_acc)}"
+            maps["edit"] = self.edit_acc
+        print(line, flush=True)
+        folder = os.path.join("output", "guide_lab_debug", self.tag)
+        os.makedirs(folder, exist_ok=True)
+        for name, t in maps.items():
+            a = (t[0, 0].float().clamp(0, 1) * 255).byte().cpu().numpy()
+            Image.fromarray(a).resize((a.shape[1] * 4, a.shape[0] * 4), Image.NEAREST).save(os.path.join(folder, f"{i + 1:02d}_{name}.png"))
+
+    def step_of(self, sigma):
+        s = float(torch.as_tensor(sigma).flatten()[0])
+        return min(range(len(self.plan)), key=lambda i: abs(self.sigmas[i] - s))
+
+    def needs_uncond(self, sigma):
+        cfg = self.cfg
+        if cfg.ref_guide <= 0 or cfg.edit_thr <= 0:
+            return False
+        s = float(torch.as_tensor(sigma).flatten()[0])
+        return cfg.edit_end * self.sigmas[0] <= s <= cfg.edit_start * self.sigmas[0]
+
+    def _remember(self, old, new):
+        return new if old is None else self.cfg.smooth * old + (1 - self.cfg.smooth) * new
+
+    def _distance_on(self):
+        cfg = self.cfg
+        return cfg.dist_calib > 0 or (cfg.dist_tau > 0 and cfg.ref_guide < 1)
+
+    def _distance_freedom(self, x0, ref, coverage, mask):
+        cfg = self.cfg
+        if not self._distance_on():
+            return 0.0
+        if self.ref_std is None:
+            self.ref_std = ref[coverage.expand_as(ref) > 0].float().std()
+        d = token_rms(x0, ref) / self.ref_std
+        self.dist = self._remember(self.dist, blur(d, round(cfg.dist_blur * TOKEN)))
+        if cfg.dist_calib > 0:
+            outside = ((mask > 0.5) & (coverage > 0)).expand_as(self.dist)
+            background = self.dist[outside] if outside.any() else self.dist[(coverage > 0).expand_as(self.dist)]
+            tau = cfg.dist_calib * torch.quantile(background.float(), 0.9).clamp(min=1e-3)
+        else:
+            tau = cfg.dist_tau * cfg.ref_guide / (1 - cfg.ref_guide)
+        free = self.dist.pow(cfg.dist_pow) / (self.dist.pow(cfg.dist_pow) + tau ** cfg.dist_pow)
+        if cfg.free_latch:
+            self.free_max = free if self.free_max is None else torch.maximum(self.free_max, free)
+            free = self.free_max
+        if cfg.free_grow > 0:
+            free = _grow(free, cfg.free_grow)
+        return free
+
+    def _update_edit_map(self, cond_x0, uncond_x0, mask):
+        e = token_rms(cond_x0, uncond_x0)
+        region = (mask < 0.5).expand_as(e)
+        if self.cfg.edit_region_norm and region.any():
+            scale = torch.stack([torch.quantile(b[r], self.cfg.edit_q) for b, r in zip(e, region)])
+        else:
+            scale = torch.quantile(e.flatten(1), self.cfg.edit_q, dim=1)
+        e = (e / (scale.view(-1, 1, 1, 1) + 1e-6)).clamp(0, 1)
+        self.edit_ema = self._remember(self.edit_ema, e)
+        self.edit_acc = self.edit_ema if self.edit_acc is None else torch.maximum(self.edit_acc, self.edit_ema)
+
+    def apply(self, sigma, x0, ref, mask, coverage, cond_x0=None, uncond_x0=None):
+        """x0, ref: (B, C, H, W); mask, coverage: (1, 1, H, W) in 0..1. cond_x0 / uncond_x0 feed the edit map."""
+        cfg = self.cfg
+        i = self.step_of(sigma)
+        early, late = self.plan[i]
+        hold = self.hold[i]
+        if early == 0 and late == 0 and hold == 0:
+            return x0
+        if self.needs_uncond(sigma) and cond_x0 is not None and uncond_x0 is not None:
+            self._update_edit_map(cond_x0, uncond_x0, mask)
+        free = self._distance_freedom(x0, ref, coverage, mask) if late > 0 else 0.0
+        if self.edit_acc is not None:
+            edit = _smoothstep((self.edit_acc - (cfg.edit_thr - cfg.edit_soft / 2)) / cfg.edit_soft)
+            if cfg.edit_grow > 0:
+                edit = _grow(edit, cfg.edit_grow)
+            free = free * edit if cfg.gate_and and self._distance_on() else 1 - (1 - free) * (1 - edit)
+        outside = mask
+        if cfg.gate_in_mask:
+            free = free * (1 - mask) ** cfg.gate_gamma
+        mask = cfg.inside + (1 - cfg.inside) * mask
+        if cfg.early_outside:
+            w = blur(mask * late * (1 - free) + outside * early + (1 - outside) * hold, round(cfg.feather * min(x0.shape[-2:]))) * coverage
+        else:
+            w = blur(mask * (early + late * (1 - free)), round(cfg.feather * min(x0.shape[-2:]))) * coverage
+        if cfg.debug:
+            self._debug(i, sigma, w)
+        return torch.lerp(x0, ref.to(x0.dtype), w.to(x0.dtype))
+
+
+def add_guidance(m, cfg, reference, mask):
+    """Install reference guidance on a patched model. `reference(H, W, mask)` yields (reference latent,
+    coverage, mask weight) on the H x W target grid, or None when the reference is not aligned."""
+    run = {}   # state of the current sampling call; dropped when it ends
+
+    def sample(executor, guider, sigmas, *args):
+        run["guide"] = Guide(cfg, sigmas)
+        run["cfg1"] = math.isclose(guider.cfg, 1.0)
+        run["placed"] = {}
+        try:
+            return executor(guider, sigmas, *args)
+        finally:
+            run.clear()
+
+    def post_cfg(args):
+        denoised = args["denoised"]
+        guide = run.get("guide")
+        if guide is None:
+            return denoised
+        x0 = _to_4d(denoised)
+        size = tuple(x0.shape[-2:])
+        if size not in run["placed"]:
+            placed = reference(*size, mask)
+            if placed is None:
+                print("[krea2edit] WARNING: reference guidance needs ref_position_a 'aligned'; it is off.", flush=True)
+            run["placed"][size] = placed if placed is None else tuple(t.to(x0.device) for t in placed)
+        placed = run["placed"][size]
+        if placed is None:
+            return denoised
+        ref, coverage, weight = placed
+        cond = uncond = None
+        if guide.needs_uncond(args["sigma"]) and args["uncond"] is not None:
+            cond, uncond = _to_4d(args["cond_denoised"]), _to_4d(args["uncond_denoised"])
+        out = guide.apply(args["sigma"], x0, ref[:1].expand(x0.shape[0], -1, -1, -1), weight, coverage, cond, uncond)
+        return out.reshape(denoised.shape)
+
+    def calc_cond(args):
+        # the unconditional pass is forced for the whole run (disable_cfg1_optimization); drop it again
+        # where the edit map does not need it and CFG is 1, which then returns the conditional prediction
+        conds = args["conds"]
+        guide = run.get("guide")
+        if guide is not None and run["cfg1"] and not guide.needs_uncond(args["sigma"]):
+            conds = [conds[0], None]
+        return comfy.samplers.calc_cond_batch(args["model"], conds, args["input"], args["sigma"], args["model_options"])
+
+    m.set_model_sampler_post_cfg_function(post_cfg, disable_cfg1_optimization=cfg.edit_thr > 0)
+    if cfg.edit_thr > 0:
+        m.set_model_sampler_calc_cond_batch_function(calc_cond)
+    comfy.patcher_extension.add_wrapper_with_key(
+        comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, "krea2_edit_advanced_guide", sample, m.model_options, is_model_options=True)
+
+
+class Krea2EditAdvanced(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "model": ("MODEL",),
-        }, "optional": {
-            "source_latent_a": ("LATENT", {"tooltip": "1st reference (the scene in two-image workflows, or the only image) -> RoPE frame=1. All *_a inputs control this reference. Not needed (and ignored) when vae + source_image_a are connected"}),
-            "source_latent_b": ("LATENT", {"tooltip": "2nd reference (the person) for multi-ref LoRAs -> RoPE frame=2, training-matched order: a first, b second. All *_b inputs control this reference. Ignored when vae + source_image_a are connected"}),
-            "ref_boost_a": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
-                                       "tooltip": "reference-fidelity dial for reference a: multiplies target->reference attention. 1.0 = off, >1 pulls harder toward the reference's appearance, <1 loosens. Optimal value is model-specific"}),
-            "ref_boost_b": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
-                                       "tooltip": "same dial for reference b. No effect without a b reference. 1.0 = off"}),
-            "fit_mode": (["fit", "crop (legacy)"], {"default": "fit",
-                          "tooltip": "how an image source fits a mismatched output aspect ratio (needs vae + source_image_a connected): fit = resample the source to the target grid at a centered offset — matches how this model was trained (default, use this); crop (legacy) = center-crop to the target AR then resize (v1/v1.1 geometry, only for older weights)"}),
-            "ref_boost_mask_a": ("MASK", {"tooltip": "optional region on reference a to boost, e.g. the face. Draw it on the same image you connect as reference a (any resolution); it follows the crop/resize the reference goes through. Gray values scale the boost proportionally (0 = no boost, 1 = full). Empty = whole reference"}),
-            "ref_boost_mask_b": ("MASK", {"tooltip": "same for reference b: drawn on the image you connect as reference b; gray values scale ref_boost_b proportionally. Empty = whole reference"}),
-            "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image_a: enables the blur-proof pixel-space path (crop+resize in pixels, encode internally) — immune to input/output resolution mismatches"}),
-            "source_image_a": ("IMAGE", {"tooltip": "reference a as IMAGE (with vae connected): overrides source_latent_a (and source_latent_b) with exact pixel-space fitting — fixes blurry results from mismatched resolutions"}),
-            "source_image_b": ("IMAGE", {"tooltip": "reference b as IMAGE (with vae and source_image_a)"}),
-            # declared last on purpose: appending keeps every existing socket index put,
-            # so workflows saved before this input still reload with their links intact.
-            "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image_a: wire the SAME latent you feed KSampler.latent_image. Lets the node VAE-encode the source here, before sampling starts, instead of on the first step — otherwise the VAE is pulled onto the GPU mid-sampling and can evict part of the diffusion model, slowing every remaining step on VRAM-tight setups"}),
-            # appended last, same reason as target_latent
-            "ref_position_a": (REF_POSITIONS, {"default": REF_POSITIONS[0],
-                               "tooltip": "where reference a sits in position space. aligned (trained) = pinned onto the output layout, how the models were trained (default). beside = placed next to the canvas: identity still flows but the layout pin is gone, so the content can be restaged more freely. bag of features = experimental, content without layout"}),
-            "ref_position_b": (REF_POSITIONS, {"default": REF_POSITIONS[0],
-                               "tooltip": "the same choice for reference b; no effect without a b reference. For putting a person into a scene: a (scene) aligned + b (person) beside"}),
-        }}
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Krea2EditAdvanced",
+            display_name="Krea2 Edit Advanced (source patch)",
+            category="krea2edit",
+            description="Adds the krea2_edit in-context source-preservation path (source latent as frame=1 tokens) to a Krea2 model.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Latent.Input("source_latent_a", tooltip="1st reference (the scene in two-image workflows, or the only image) -> RoPE frame=1. All *_a inputs control this reference"),
+                io.Latent.Input("source_latent_b", optional=True, tooltip="2nd reference (the person) for multi-ref LoRAs -> RoPE frame=2, training-matched order: a first, b second. All *_b inputs control this reference"),
+                io.Float.Input("ref_boost_a", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="reference-fidelity dial for reference a: multiplies target->reference attention. 1.0 = off, >1 pulls harder toward the reference's appearance, <1 loosens. Optimal value is model-specific"),
+                io.Float.Input("ref_boost_b", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="same dial for reference b. No effect without a b reference. 1.0 = off"),
+                io.Mask.Input("ref_boost_mask_a", optional=True, tooltip="optional region on reference a to boost, e.g. the face. Draw it on the same image you connect as reference a (any resolution); it follows the crop/resize the reference goes through. Gray values scale the boost proportionally (0 = no boost, 1 = full). Empty = whole reference"),
+                io.Mask.Input("ref_boost_mask_b", optional=True, tooltip="same for reference b: drawn on the image you connect as reference b; gray values scale ref_boost_b proportionally. Empty = whole reference"),
+                io.Combo.Input("ref_position_a", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="where reference a sits in position space. aligned (trained) = pinned onto the output layout, how the models were trained (default). beside = placed next to the canvas: identity still flows but the layout pin is gone, so the content can be restaged more freely. bag of features = experimental, content without layout"),
+                io.Combo.Input("ref_position_b", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="the same choice for reference b; no effect without a b reference. For putting a person into a scene: a (scene) aligned + b (person) beside"),
+            ],
+            outputs=[io.Model.Output()],
+        )
 
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "patch"
-    CATEGORY = "krea2edit"
-    DESCRIPTION = "Adds the krea2_edit in-context source-preservation path (source latent as frame=1 tokens) to a Krea2 model."
-
-    def patch(self, model, source_latent_a=None, source_latent_b=None, ref_boost_a=1.0, ref_boost_b=1.0,
-              ref_boost_mask_a=None, ref_boost_mask_b=None, vae=None, source_image_a=None,
-              source_image_b=None, fit_mode="fit", target_latent=None,
-              ref_position_a="aligned (trained)", ref_position_b="aligned (trained)", **_future):
-        _reject_renamed(_future)
-        if _future:
-            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
-                  f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
-                  f"installed node pack. Update comfyui-krea2edit (Manager -> Update, or git "
-                  f"pull) and restart ComfyUI. Continuing without them.", flush=True)
+    @classmethod
+    def execute(cls, model, source_latent_a, source_latent_b=None, ref_boost_a=1.0, ref_boost_b=1.0,
+                ref_boost_mask_a=None, ref_boost_mask_b=None, ref_position_a="aligned (trained)",
+                ref_position_b="aligned (trained)"):
         if not (ref_position_a.startswith("aligned") and ref_position_b.startswith("aligned")):
             print(f"[krea2edit] reference placement: a={ref_position_a!r}, "
                   f"b={ref_position_b!r}", flush=True)
         m = model.clone()
-        pixel_path = vae is not None and source_image_a is not None
-        src_samples = None
-        if not pixel_path:
-            if source_latent_a is None:
-                raise ValueError("Krea2EditModelPatch: connect source_latent_a, or vae + source_image_a")
-            # The target latent reaches the diffusion model already scaled (process_latent_in);
-            # scale the source(s) the same way so all share one latent space.
-            src_samples = model.model.process_latent_in(source_latent_a["samples"])
-            if source_latent_b is not None:
-                src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
-
-        px_cache = {}   # pixel-path encoded sources, keyed per target resolution
-        mm = model.model  # for process_latent_in on the pixel path
-        state = {"announced": False}
-
-        if fit_mode == "fit" and not pixel_path:
-            print(f"[krea2edit] WARNING: fit_mode='fit' has NO EFFECT — it needs both "
-                  f"'vae' and 'source_image_a' connected (the pixel path). Falling back to the "
-                  f"latent crop path.", flush=True)
-
-        # Pre-encode OUTSIDE the sampling window. vae.encode -> load_models_gpu ->
-        # free_memory(keep_loaded=[]), which partially unloads whatever is resident —
-        # including the diffusion model, if the first call lands inside the sampler.
-        # Nothing re-expands it (sampler_helpers loads once, before the loop), so the
-        # rest of the run streams weights from CPU every step. Running the encode here,
-        # at node-execution time, restores the ordinary VAEEncode -> KSampler order
-        # where the sampler evicts the VAE instead of the reverse.
-        primed = None
-        if pixel_path:
-            if target_latent is not None:
-                Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
-                print(f"[krea2edit] pre-encoding sources at target {Hh * 8}x{Ww * 8}px "
-                      f"(before sampling, fit_mode={fit_mode})", flush=True)
-                _fit_encode_image(source_image_a, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode)
-                if source_image_b is not None:
-                    _fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode)
-                primed = (Hh, Ww)
-            else:
-                print("[krea2edit] NOTE: connect 'target_latent' (the same latent that feeds "
-                      "KSampler.latent_image) to pre-encode the source here instead of on the "
-                      "first sampling step. Without it the VAE is loaded mid-sampling and can "
-                      "evict part of the diffusion model, slowing every remaining step.",
-                      flush=True)
+        # The target latent reaches the diffusion model already scaled (process_latent_in);
+        # scale the source(s) the same way so all share one latent space.
+        src = model.model.process_latent_in(source_latent_a["samples"])
+        if source_latent_b is not None:
+            src = [src, model.model.process_latent_in(source_latent_b["samples"])]
 
         def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
             # ComfyUI signature drift (2026-07-19, commit c9602625 adds ref_latents):
@@ -416,44 +541,19 @@ class Krea2EditModelPatch:
                         transformer_options = a
                         break
             dm = executor.class_obj  # the SingleStreamDiT instance
-            src = src_samples
-            if pixel_path:
-                xx = _to_4d(x)
-                Hh, Ww = xx.shape[-2], xx.shape[-1]
-                # not `if not px_cache` — the cache is already primed when target_latent
-                # is wired, so an explicit one-shot flag is needed to announce once.
-                if not state["announced"]:
-                    state["announced"] = True
-                    print(f"[krea2edit] pixel path ACTIVE (fit_mode={fit_mode})", flush=True)
-                    if primed is not None and primed != (Hh, Ww):
-                        print(f"[krea2edit] WARNING: 'target_latent' is {primed[0] * 8}x{primed[1] * 8}px but "
-                              f"sampling is at {Hh * 8}x{Ww * 8}px — the pre-encode is unused and the VAE "
-                              f"will run mid-sampling. Wire the SAME latent that feeds KSampler.",
-                              flush=True)
-                lat = mm.process_latent_in(_fit_encode_image(source_image_a, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode))
-                if source_image_b is not None:
-                    lat = [lat, mm.process_latent_in(_fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode))]
-                src = lat
-            mask_a, mask_b = ref_boost_mask_a, ref_boost_mask_b
-            if pixel_path:
-                mask_a = _crop_mask_to_image(mask_a, source_image_a, Hh, Ww, fit_mode)
-                mask_b = _crop_mask_to_image(mask_b, source_image_b, Hh, Ww, fit_mode)
-            v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
-                                   ref_boost_a=ref_boost_a, ref_boost_b=ref_boost_b,
-                                   ref_boost_mask_a=mask_a, ref_boost_mask_b=mask_b,
-                                   ref_native=(fit_mode == "fit" and pixel_path),
-                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"),
-                                   ref_position_a=ref_position_a, ref_position_b=ref_position_b)
-            return v
+            return krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
+                                      ref_boost_a=ref_boost_a, ref_boost_b=ref_boost_b,
+                                      ref_boost_mask_a=ref_boost_mask_a, ref_boost_mask_b=ref_boost_mask_b,
+                                      ref_position_a=ref_position_a, ref_position_b=ref_position_b)
 
         to = m.model_options.setdefault("transformer_options", {})
         comfy.patcher_extension.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit", wrapper, to
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit_advanced", wrapper, to
         )
-        return (m,)
+        return io.NodeOutput(m)
 
 
-class Krea2EditGroundedEncode:
+class Krea2EditAdvancedGroundedEncode(io.ComfyNode):
     """Image-grounded instruction encode — the SEMANTIC path of krea2_edit.
 
     Training always encodes the instruction TOGETHER with the source image through
@@ -488,26 +588,22 @@ class Krea2EditGroundedEncode:
                 + vis + "{}<|im_end|>\n<|im_start|>assistant\n")
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip": ("CLIP",),
-                "prompt": ("STRING", {"multiline": True, "default": ""}),
-            },
-            "optional": {
-                "image_a": ("IMAGE", {"tooltip": "1st reference (the scene, or the only image) — the same image as source_image_a / source_latent_a"}),
-                "image_b": ("IMAGE", {"tooltip": "2nd reference (the person) for multi-ref LoRAs; vision blocks in training order: a, b"}),
-                "grounding_px": ("INT", {"default": 768, "min": 0, "max": 4096, "step": 64,
-                                          "tooltip": "cap longest side fed to Qwen3-VL; 0 = native"}),
-                "system_prompt": ("STRING", {"multiline": True, "default": "",
-                                              "tooltip": "advanced (optional): override the grounding system prompt (empty = training default). Steers what the vision encoder attends to, e.g. facial identity detail."}),
-            },
-        }
-
-    RETURN_TYPES = ("CONDITIONING",)
-    FUNCTION = "encode"
-    CATEGORY = "krea2edit"
-    DESCRIPTION = "Encodes the edit instruction grounded on the source image (training-matched semantic path)."
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Krea2EditAdvancedGroundedEncode",
+            display_name="Krea2 Edit Advanced (grounded encode)",
+            category="krea2edit",
+            description="Encodes the edit instruction grounded on the source image (training-matched semantic path).",
+            inputs=[
+                io.Clip.Input("clip"),
+                io.String.Input("prompt", multiline=True, default=""),
+                io.Image.Input("image_a", optional=True, tooltip="1st reference (the scene, or the only image) — the image you encode into source_latent_a"),
+                io.Image.Input("image_b", optional=True, tooltip="2nd reference (the person) for multi-ref LoRAs; vision blocks in training order: a, b"),
+                io.Int.Input("grounding_px", default=768, min=0, max=4096, step=64, optional=True, tooltip="cap longest side fed to Qwen3-VL; 0 = native"),
+                io.String.Input("system_prompt", multiline=True, default="", optional=True, tooltip="advanced (optional): override the grounding system prompt (empty = training default). Steers what the vision encoder attends to, e.g. facial identity detail."),
+            ],
+            outputs=[io.Conditioning.Output()],
+        )
 
     KREA2_EDIT_TEMPLATE_2REF = (
         "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
@@ -517,7 +613,8 @@ class Krea2EditGroundedEncode:
         "{}<|im_end|>\n<|im_start|>assistant\n"
     )
 
-    def _prep(self, image, grounding_px):
+    @classmethod
+    def _prep(cls, image, grounding_px):
         samples = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
         h, w = samples.shape[2], samples.shape[3]
         if grounding_px and max(h, w) > grounding_px:
@@ -525,31 +622,26 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image_a=None, image_b=None, grounding_px=768, system_prompt="", **_future):
-        _reject_renamed(_future)
-        if _future:
-            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
-                  f"know ({', '.join(sorted(_future))}). Update comfyui-krea2edit and restart "
-                  f"ComfyUI. Continuing without them.", flush=True)
+    @classmethod
+    def execute(cls, clip, prompt, image_a=None, image_b=None, grounding_px=768, system_prompt=""):
         if image_a is None:  # text-only fallback = old behavior
             tokens = clip.tokenize(prompt)
-            return (clip.encode_from_tokens_scheduled(tokens),)
-        imgs = [self._prep(image_a, grounding_px)]
+            return io.NodeOutput(clip.encode_from_tokens_scheduled(tokens))
+        imgs = [cls._prep(image_a, grounding_px)]
         if image_b is not None:
-            imgs.append(self._prep(image_b, grounding_px))
-        template = self._template(len(imgs), system_prompt)
+            imgs.append(cls._prep(image_b, grounding_px))
+        template = cls._template(len(imgs), system_prompt)
         tokens = clip.tokenize(prompt, images=imgs, llama_template=template)
-        return (clip.encode_from_tokens_scheduled(tokens),)
+        return io.NodeOutput(clip.encode_from_tokens_scheduled(tokens))
 
 
-NODE_CLASS_MAPPINGS = {
-    "Krea2EditModelPatch": Krea2EditModelPatch,
-    "Krea2EditGroundedEncode": Krea2EditGroundedEncode,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "Krea2EditModelPatch": "Krea2 Edit (source patch)",
-    "Krea2EditGroundedEncode": "Krea2 Edit (grounded encode)",
-}
+class Krea2EditExtension(ComfyExtension):
+    async def get_node_list(self):
+        return [Krea2EditAdvanced, Krea2EditAdvancedGroundedEncode]
+
+
+async def comfy_entrypoint():
+    return Krea2EditExtension()
 
 
 def _pack_version():

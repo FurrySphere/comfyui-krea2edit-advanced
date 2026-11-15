@@ -29,6 +29,8 @@ import importlib.util
 import os
 import sys
 
+import torch
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PACK = os.path.dirname(_HERE)                       # .../custom_nodes/comfyui-krea2edit
 _COMFY_ROOT = os.path.dirname(os.path.dirname(_PACK))  # .../ComfyUI
@@ -68,10 +70,9 @@ class _FakeModelPatcher:
 def _get_wrapper(mod):
     import comfy.patcher_extension as pe
 
-    node = mod.Krea2EditModelPatch()
-    (m,) = node.patch(_FakeModelPatcher(), {"samples": object()})
+    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), {"samples": object()})
     to = m.model_options["transformer_options"]
-    return to["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit"][0]
+    return to["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
 
 
 def test_wrapper_accepts_upstream_positional_call():
@@ -92,7 +93,7 @@ def test_wrapper_accepts_upstream_positional_call():
     )
 
     result = executor.execute(
-        None,   # x
+        torch.zeros(1, 4, 8, 8),   # x
         None,   # timesteps
         None,   # context
         None,   # attention_mask
@@ -122,9 +123,9 @@ def test_transformer_options_picked_up_under_both_signatures():
             wrappers=[wrapper], idx=0,
         )
         if shape == "old":
-            executor.execute(None, None, None, None, marker)              # ...attention_mask, t_opts
+            executor.execute(torch.zeros(1, 4, 8, 8), None, None, None, marker)              # ...attention_mask, t_opts
         else:
-            executor.execute(None, None, None, None, ["ref"], marker)     # ...ref_latents, t_opts
+            executor.execute(torch.zeros(1, 4, 8, 8), None, None, None, ["ref"], marker)     # ...ref_latents, t_opts
         assert captured["to"] is marker, f"{shape}: got {captured['to']}, expected the trailing dict"
 
 

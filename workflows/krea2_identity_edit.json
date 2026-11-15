@@ -251,8 +251,7 @@
           "links": [
             6,
             7,
-            8,
-            16
+            8
           ]
         }
       ],
@@ -334,8 +333,7 @@
           "links": [
             11,
             12,
-            13,
-            14
+            13
           ]
         },
         {
@@ -400,7 +398,7 @@
     },
     {
       "id": 79,
-      "type": "Krea2EditModelPatch",
+      "type": "Krea2EditAdvanced",
       "pos": [
         2320,
         -160
@@ -434,30 +432,6 @@
           "shape": 7,
           "type": "MASK",
           "link": null
-        },
-        {
-          "name": "vae",
-          "shape": 7,
-          "type": "VAE",
-          "link": 16
-        },
-        {
-          "name": "source_image_a",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 14
-        },
-        {
-          "name": "source_image_b",
-          "shape": 7,
-          "type": "IMAGE",
-          "link": 20
-        },
-        {
-          "name": "target_latent",
-          "shape": 7,
-          "type": "LATENT",
-          "link": 27
         }
       ],
       "outputs": [
@@ -470,12 +444,11 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "Krea2EditModelPatch"
+        "Node name for S&R": "Krea2EditAdvanced"
       },
       "widgets_values": [
         4,
-        4,
-        "fit"
+        4
       ]
     },
     {
@@ -515,8 +488,7 @@
           "name": "LATENT",
           "type": "LATENT",
           "links": [
-            24,
-            27
+            24
           ]
         }
       ],
@@ -575,7 +547,7 @@
     },
     {
       "id": 84,
-      "type": "Krea2EditGroundedEncode",
+      "type": "Krea2EditAdvancedGroundedEncode",
       "pos": [
         1620,
         -160
@@ -616,7 +588,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "Krea2EditGroundedEncode"
+        "Node name for S&R": "Krea2EditAdvancedGroundedEncode"
       },
       "widgets_values": [
         "Change her outfit to a red raincoat.",
@@ -626,7 +598,7 @@
     },
     {
       "id": 85,
-      "type": "Krea2EditGroundedEncode",
+      "type": "Krea2EditAdvancedGroundedEncode",
       "pos": [
         1620,
         250
@@ -670,7 +642,7 @@
       ],
       "title": "negative (leave empty)",
       "properties": {
-        "Node name for S&R": "Krea2EditGroundedEncode"
+        "Node name for S&R": "Krea2EditAdvancedGroundedEncode"
       },
       "widgets_values": [
         "",
@@ -700,8 +672,7 @@
           "links": [
             17,
             18,
-            19,
-            20
+            19
           ]
         },
         {
@@ -889,7 +860,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "THE FIDELITY DIAL (ref_boost_a / ref_boost_b) - how hard the model looks at your\nreference. New in this release.\n\n  1.0 = classic v1.1 behavior\n  4.0 = recommended (pre-set): much stronger face + body likeness,\n        more reliable edits\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a is the dial for image 1 (your image / the scene), ref_boost_b\nfor image 2 (the person, group 2). Both ship at 4.0; in two-image mode\nset ref_boost_a back to 1.0 unless you are exploring.\n\nfit_mode: how inputs fit a different output aspect\nratio. fit = resample to the output shape (default, recommended); crop (legacy) = center-crop\nonly for v1/v1.1 weights."
+        "THE FIDELITY DIAL (ref_boost_a / ref_boost_b) - how hard the model looks at your\nreference. New in this release.\n\n  1.0 = classic v1.1 behavior\n  4.0 = recommended (pre-set): much stronger face + body likeness,\n        more reliable edits\n  >10 = over-copy: removals/replacements start failing\n  <1  = suppress the reference (creative freedom)\n\nref_boost_a is the dial for image 1 (your image / the scene), ref_boost_b\nfor image 2 (the person, group 2). Both ship at 4.0; in two-image mode\nset ref_boost_a back to 1.0 unless you are exploring."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -1079,28 +1050,12 @@
       "IMAGE"
     ],
     [
-      14,
-      72,
-      0,
-      79,
-      5,
-      "IMAGE"
-    ],
-    [
       15,
       73,
       0,
       79,
       1,
       "LATENT"
-    ],
-    [
-      16,
-      57,
-      0,
-      79,
-      4,
-      "VAE"
     ],
     [
       17,
@@ -1124,14 +1079,6 @@
       0,
       85,
       2,
-      "IMAGE"
-    ],
-    [
-      20,
-      90,
-      0,
-      79,
-      6,
       "IMAGE"
     ],
     [
@@ -1181,14 +1128,6 @@
       29,
       0,
       "IMAGE"
-    ],
-    [
-      27,
-      82,
-      0,
-      79,
-      7,
-      "LATENT"
     ]
   ],
   "groups": [

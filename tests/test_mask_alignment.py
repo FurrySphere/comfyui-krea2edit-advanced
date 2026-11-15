@@ -23,7 +23,7 @@ if _HERE not in sys.path:
 
 import comfy.patcher_extension as pe                                          # noqa: E402
 
-from test_pre_encode import _FakeModelPatcher, _latent, _load_pack           # noqa: E402
+from stubs import _FakeModelPatcher, _load_pack           # noqa: E402
 from test_ref_controls import TXT, _FakeDiT                                   # noqa: E402
 
 BOOST = 3.0
@@ -64,8 +64,8 @@ def _image(ih, iw, rect):
 def _run(mod, H, W, ref_index=0, **patch_kw):
     """Run the real forward through the wrapper; returns (content of ref tokens, boost map of ref tokens)."""
     dm = _RecordingDiT()
-    (m,) = mod.Krea2EditModelPatch().patch(_FakeModelPatcher(), **patch_kw)
-    wrapper = m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit"][0]
+    (m,) = mod.Krea2EditAdvanced.execute(_FakeModelPatcher(), **patch_kw)
+    wrapper = m.model_options["transformer_options"]["wrappers"][pe.WrappersMP.DIFFUSION_MODEL]["krea2_edit_advanced"][0]
     ex = pe.WrapperExecutor(original=lambda *a, **k: None, class_obj=dm, wrappers=[wrapper], idx=0)
     ex.execute(torch.zeros(1, 4, H, W), torch.tensor([0.5]), torch.zeros(1, TXT, 8), None, {})
     bias = dm.block_inputs[0][1]
@@ -86,24 +86,6 @@ def _err(content, boost_map):
 TOL = 0.06
 RECTS = [(0.10, 0.50, 0.60, 0.95), (0.55, 0.90, 0.05, 0.40), (0.30, 0.70, 0.30, 0.70)]
 
-# (image h, image w, target latent h, w)
-PIXEL_CASES = [(512, 512, 64, 64), (512, 768, 64, 64), (768, 512, 64, 64), (500, 508, 64, 64),
-               (1024, 640, 48, 80), (600, 1000, 64, 48), (336, 776, 40, 56)]
-
-
-def test_pixel_path_mask_follows_the_reference_transform():
-    mod = _load_pack()
-    for fit_mode in ("fit", "crop (legacy)"):
-        for ih, iw, H, W in PIXEL_CASES:
-            for rect in RECTS:
-                for mask_scale in (1.0, 0.5, 0.37):                  # the mask need not have the image's resolution
-                    mask = _rect(round(ih * mask_scale), round(iw * mask_scale), rect)
-                    content, boost = _run(mod, H, W, source_image_a=_image(ih, iw, rect), vae=_MarkerVAE(),
-                                          fit_mode=fit_mode, ref_boost_a=BOOST, ref_boost_mask_a=mask,
-                                          target_latent=_latent(H, W))
-                    assert _err(content, boost) < TOL, (fit_mode, (ih, iw, H, W), rect, mask_scale, _err(content, boost))
-
-
 LATENT_CASES = [(512, 512, 64, 64), (512, 768, 64, 64), (768, 512, 64, 64), (640, 1024, 48, 80)]
 
 
@@ -121,19 +103,17 @@ def test_each_reference_gets_its_own_transform():
     """a and b differ in aspect ratio, so each mask needs a different crop."""
     mod = _load_pack()
     ra, rb = RECTS[0], RECTS[1]
-    kw = dict(source_image_a=_image(512, 768, ra), source_image_b=_image(768, 512, rb), vae=_MarkerVAE(),
-              ref_boost_a=BOOST, ref_boost_b=BOOST, ref_boost_mask_a=_rect(512, 768, ra),
-              ref_boost_mask_b=_rect(768, 512, rb), target_latent=_latent(64, 64))
-    for mode in ("fit", "crop (legacy)"):
-        for idx in (0, 1):
-            content, boost = _run(mod, 64, 64, ref_index=idx, fit_mode=mode, **kw)
-            assert _err(content, boost) < TOL, (mode, idx, _err(content, boost))
+    kw = dict(source_latent_a={"samples": _MarkerVAE().encode(_image(512, 768, ra))},
+              source_latent_b={"samples": _MarkerVAE().encode(_image(768, 512, rb))},
+              ref_boost_a=BOOST, ref_boost_b=BOOST, ref_boost_mask_a=_rect(512, 768, ra), ref_boost_mask_b=_rect(768, 512, rb))
+    for idx in (0, 1):
+        content, boost = _run(mod, 64, 64, ref_index=idx, **kw)
+        assert _err(content, boost) < TOL, (idx, _err(content, boost))
 
 
 def test_unmasked_boost_is_unaffected_by_geometry():
     mod = _load_pack()
-    _, boost = _run(mod, 64, 64, source_image_a=_image(512, 768, RECTS[0]), vae=_MarkerVAE(),
-                    ref_boost_a=BOOST, target_latent=_latent(64, 64))
+    _, boost = _run(mod, 64, 64, source_latent_a={"samples": _MarkerVAE().encode(_image(512, 768, RECTS[0]))}, ref_boost_a=BOOST)
     assert torch.allclose(boost, torch.ones_like(boost), atol=1e-5)
 
 

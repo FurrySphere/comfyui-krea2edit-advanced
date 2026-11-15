@@ -18,8 +18,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from test_pre_encode import _FakeModelPatcher, _latent, _load_pack, _run_steps   # noqa: E402
-from test_ref_controls import (BESIDE, TOK, TXT, _FakeCLIP, _ValueVAE, _capture, _forward, _img,   # noqa: E402
+from stubs import _FakeModelPatcher, _latent, _load_pack, _run_steps   # noqa: E402
+from test_ref_controls import (BESIDE, TOK, TXT, _FakeCLIP, _capture, _forward, _img,   # noqa: E402
                                _src, _val, _wrapper)
 
 PACK = os.path.dirname(_HERE)
@@ -122,7 +122,7 @@ def test_distinct_sentinels_reach_the_forward_unmixed():
 
 def test_forward_and_patch_signatures_carry_matching_pairs():
     mod = _load_pack()
-    for fn in (mod.krea2_edit_forward, mod.Krea2EditModelPatch.patch):
+    for fn in (mod.krea2_edit_forward, mod.Krea2EditAdvanced.execute):
         names = set(inspect.signature(fn).parameters)
         for n in names:
             if n.endswith("_b"):
@@ -131,46 +131,11 @@ def test_forward_and_patch_signatures_carry_matching_pairs():
                 assert n[:-1] + "b" in names or n.startswith("source_"), f"{fn.__name__}: {n} has no _b counterpart"
 
 
-# ---------------------------------------------------------------- pixel-path caching
-
-def test_pre_encode_cache_keeps_the_two_images_apart():
-    """a and b are encoded under separate cache keys: with different images the pre-encode
-    and the per-step lookup must still return a first, b second."""
-    mod = _load_pack()
-    seen = _capture(mod)
-    vae = _CountingVAE()
-    w = _wrapper(mod, _src(1), vae=vae, source_image_a=_img(0.25), source_image_b=_img(0.5),
-                 target_latent=_latent())
-    assert len(vae.calls) == 2
-    _run_steps(w, n=2)
-    assert len(vae.calls) == 2, "per-step lookups must hit the pre-encoded cache"
-    assert all([_val(s) for s in src] == [0.25, 0.5] for src, _ in seen)
-
-
-def test_identical_images_for_a_and_b_are_still_two_references():
-    mod = _load_pack()
-    seen = _capture(mod)
-    vae = _CountingVAE()
-    w = _wrapper(mod, _src(1), vae=vae, source_image_a=_img(0.25), source_image_b=_img(0.25),
-                 target_latent=_latent())
-    _run_steps(w, n=1)
-    assert isinstance(seen[-1][0], list) and len(seen[-1][0]) == 2
-
-
-class _CountingVAE(_ValueVAE):
-    def __init__(self):
-        self.calls = []
-
-    def encode(self, pixels):
-        self.calls.append(float(pixels.mean()))
-        return super().encode(pixels)
-
-
 # ---------------------------------------------------------------- optional inputs
 
 def test_every_b_input_is_optional_and_unneeded():
     mod = _load_pack()
-    for node in (mod.Krea2EditModelPatch, mod.Krea2EditGroundedEncode):
+    for node in (mod.Krea2EditAdvanced, mod.Krea2EditAdvancedGroundedEncode):
         it = node.INPUT_TYPES()
         b_names = [n for sect in it.values() for n in sect if n.endswith("_b")]
         assert b_names
@@ -179,7 +144,7 @@ def test_every_b_input_is_optional_and_unneeded():
     seen = _capture(mod)
     _run_steps(_wrapper(mod, _src(1)), n=1)
     assert torch.is_tensor(seen[-1][0])
-    tokens = mod.Krea2EditGroundedEncode().encode(_FakeCLIP(), "p", image_a=_img(0.25, 64))[0]
+    tokens = mod.Krea2EditAdvancedGroundedEncode.execute(_FakeCLIP(), "p", image_a=_img(0.25, 64))[0]
     assert len(tokens["images"]) == 1
 
 
@@ -202,13 +167,11 @@ def test_shipped_workflow_wires_a_and_b_to_their_own_image():
         wf = json.load(f)
     nodes = {n["id"]: n for n in wf["nodes"]}
     links = wf["links"]
-    patch = next(n for n in wf["nodes"] if n["type"] == "Krea2EditModelPatch")
-    encoders = [n for n in wf["nodes"] if n["type"] == "Krea2EditGroundedEncode"]
+    patch = next(n for n in wf["nodes"] if n["type"] == "Krea2EditAdvanced")
+    encoders = [n for n in wf["nodes"] if n["type"] == "Krea2EditAdvancedGroundedEncode"]
 
     roots = {}
-    for name in ("source_latent_a", "source_image_a"):
-        roots[name] = _root_image(links, nodes, patch["id"], name)
-    for name in ("source_latent_b", "source_image_b"):
+    for name in ("source_latent_a", "source_latent_b"):
         roots[name] = _root_image(links, nodes, patch["id"], name)
     for enc in encoders:
         roots[f"enc{enc['id']}.image_a"] = _root_image(links, nodes, enc["id"], "image_a")
@@ -222,7 +185,7 @@ def test_shipped_workflow_wires_a_and_b_to_their_own_image():
 
     names = {i["name"] for i in patch["inputs"]}
     assert not names & {"source_latent", "source_image", "ref_boost_mask", "ref_boost", "ref_position"}
-    assert patch["widgets_values"][:3] == [4, 4, "fit"]
+    assert patch["widgets_values"][:2] == [4, 4]
     assert all(i["name"] != "image" for e in encoders for i in e["inputs"])
 
 
