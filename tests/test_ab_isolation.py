@@ -114,7 +114,7 @@ def test_distinct_sentinels_reach_the_forward_unmixed():
     src, k = seen[-1]
     assert [_val(s) for s in src] == [1.0, 2.0]
     assert (k["ref_boost_a"], k["ref_boost_b"]) == (1.5, 2.5)
-    assert k["ref_boost_mask_a"] is ma and k["ref_boost_mask_b"] is mb
+    assert torch.equal(k["ref_boost_mask_a"], ma) and torch.equal(k["ref_boost_mask_b"], mb)
     assert (k["ref_position_a"], k["ref_position_b"]) == (BESIDE, BAG)
 
 

@@ -5,6 +5,37 @@ which ended at v2.0.0. Everything from "Before 3.0.0" down is the history of the
 change made in this fork before 3.0.0, and uses the original node names. LoRA weights:
 https://huggingface.co/conradlocke/krea2-identity-edit
 
+## 3.1.0 — 2026-11-25 — outpainting, signed feather, mask alignment
+
+### Added
+- **Outpainting.** A source latent that is smaller than the sampled picture is no longer enlarged: it keeps its size
+  and is placed in the picture, the way the original's `fit` mode did it (RoPE offsets at the center, stride 1).
+  `ref_x_percent` and `ref_y_percent` (under `aligned (trained)`, default 50 / 50) place source A in the free space;
+  the second source is always centered. The picture around the source is drawn freely.
+- **A larger source is cut, not resized.** A source latent that is larger than the sampled picture in a direction
+  keeps its size too: only the part inside the picture is used, and `ref_x_percent` / `ref_y_percent` choose which
+  part (0 = left or top part, 50 = middle, 100 = right or bottom part). The edit mask and the boost masks are cut with it.
+  Each direction follows its own rule: a source can be cut in one direction and placed with gaps in the other.
+- The source hold and the edit mask follow the placement: nothing is pulled where the source shows nothing, and
+  everything outside the source is edit area. Grow and feather act on the source's border like on any mask edge.
+- `target_latent` (optional): only gives the `MASK` output the size of the picture being drawn.
+
+### Changed
+- `feather_percent` now is the length of the fade and lies outside the drawn areas: an area keeps its own value
+  (white or gray) and fades out into the darker surroundings; a soft edge drawn by hand moves outward by about half
+  the feather. A negative feather (range is now -100 to 100) fades inwards instead: the fade lies inside the drawn
+  areas and nothing outside them is lit. Before it was the radius of a blur that straddled the edge. Saved workflows with a feather above 0
+  look different (use about 2 to 4 times the old value for a similar fade).
+- A source of another size is no longer cropped to the picture's aspect ratio and resized in latent space, which
+  softened it. It keeps its size: a smaller one is placed, a larger one is cut (see Added). To use all of a larger
+  source, scale the image to the output size before VAE Encode. The warning now appears for a larger source only and
+  says that only the part that fits is used.
+
+### Fixed
+- A mask drawn on the picture that was encoded (any size from `cells × 8` to `cells × 8 + 7` pixels per side) now
+  follows the VAE's own crop to a multiple of 8 pixels, instead of being stretched over the latent. This applies to
+  `edit_mask` and `ref_boost_mask_a/b`. Other mask sizes are resized as a whole, as before.
+
 ## 3.0.0 — Krea2 Edit Advanced: source hold and edit mask (breaking)
 
 The package is renamed to `comfyui-krea2edit-advanced`. The nodes moved to the V3 schema under new ids, so they

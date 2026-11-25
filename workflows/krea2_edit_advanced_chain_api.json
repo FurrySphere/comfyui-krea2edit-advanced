@@ -111,7 +111,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 1: source patch"
@@ -230,7 +230,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 2: source patch"
@@ -349,7 +349,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 3: source patch"
@@ -468,7 +468,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 4: source patch"
@@ -587,7 +587,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 5: source patch"
@@ -706,7 +706,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Edit 6: source patch"

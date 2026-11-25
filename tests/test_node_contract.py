@@ -29,7 +29,9 @@ HOLD_INPUTS = {          # the inputs that only exist while reference a is align
     "source_hold": ("required", "BOOLEAN", {"default": True}),
     "hold_strength": ("required", "FLOAT", {"default": 0.7, "min": 0.0, "max": 10.0, "step": 0.05}),
     "grow_percent": ("required", "FLOAT", {"default": 0.0, "min": -100.0, "max": 100.0, "step": 0.5}),
-    "feather_percent": ("required", "FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.5}),
+    "feather_percent": ("required", "FLOAT", {"default": 0.0, "min": -100.0, "max": 100.0, "step": 0.5}),
+    "ref_x_percent": ("required", "FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
+    "ref_y_percent": ("required", "FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0}),
     "edit_mask": ("optional", "MASK", {}),
 }
 PATCH_INPUTS = {          # name -> (group, type, options without the tooltip), in declaration order
@@ -42,6 +44,7 @@ PATCH_INPUTS = {          # name -> (group, type, options without the tooltip), 
     "ref_boost_mask_a": ("optional", "MASK", {}),
     "ref_boost_mask_b": ("optional", "MASK", {}),
     "ref_position_b": ("optional", POSITIONS, {"default": POSITIONS[0]}),
+    "target_latent": ("optional", "LATENT", {}),
 }
 ENCODE_INPUTS = {
     "clip": ("required", "CLIP", {}),
@@ -60,6 +63,7 @@ SNAPSHOT = {
     'pair_boosts': {'out': (1, 4, 16, 16), 'seq': (1, 195, 8), 'pos': 1536.0, 'pos_shape': (1, 195, 3), 'bias': ((1, 1, 195, 195), 5919.481, 0.0, 1.099)},
     'pair_beside_bag': {'out': (1, 4, 16, 16), 'seq': (1, 195, 8), 'pos': 2048.0, 'pos_shape': (1, 195, 3), 'bias': None},
     'source_larger_than_target': {'out': (1, 4, 16, 16), 'seq': (1, 131, 8), 'pos': 960.0, 'pos_shape': (1, 131, 3), 'bias': ((1, 1, 131, 131), 2839.131, 0.0, 0.693)},
+    'source_smaller_than_target': {'out': (1, 4, 16, 16), 'seq': (1, 83, 8), 'pos': 576.0, 'pos_shape': (1, 83, 3), 'bias': None},
     'batch_of_two': {'out': (2, 4, 16, 16), 'seq': (2, 131, 8), 'pos': 1920.0, 'pos_shape': (2, 131, 3), 'bias': None},
     'five_d_target': {'out': (1, 4, 1, 16, 16), 'seq': (1, 131, 8), 'pos': 960.0, 'pos_shape': (1, 131, 3), 'bias': None},
 }
@@ -105,6 +109,7 @@ def _cases():
         "pair_boosts": (([_src(1), _src(2)],), dict(ref_boost_a=2.0, ref_boost_b=3.0, ref_boost_mask_a=top)),
         "pair_beside_bag": (([_src(1), _src(2)],), dict(ref_position_a=POSITIONS[1], ref_position_b=POSITIONS[2])),
         "source_larger_than_target": ((torch.full((1, 4, 24, 32), 1.0),), dict(ref_boost_a=2.0, ref_boost_mask_a=torch.ones(48, 64))),
+        "source_smaller_than_target": ((_src(1, size=8),), {}),
         "batch_of_two": ((_src(1),), dict(x=torch.zeros(2, 4, 16, 16))),
         "five_d_target": ((_src(1),), dict(x=torch.zeros(1, 4, 1, 16, 16))),
     }

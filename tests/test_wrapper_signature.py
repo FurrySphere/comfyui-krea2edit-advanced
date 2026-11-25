@@ -107,14 +107,14 @@ def test_a_source_of_another_size_than_the_sampled_latent_warns_once():
 
     mod = _load_pack()
     mod.krea2_edit_forward = lambda *a, **k: None
-    for sampled, warns in ((8, 0), (6, 1)):
+    for sampled, warns in ((8, 0), (6, 1), (12, 0)):              # equal, smaller than the source, larger than the source (outpainting)
         wrapper = _get_wrapper(mod)
         executor = pe.WrapperExecutor(original=lambda *a, **k: None, class_obj=object(), wrappers=[wrapper], idx=0)
         log = io.StringIO()
         with contextlib.redirect_stdout(log):
             for _ in range(3):
                 executor.execute(torch.zeros(1, 4, sampled, sampled), None, None, None, {})
-        assert log.getvalue().count("WARNING: source_latent_a is 64x64px but the picture is drawn at") == warns, sampled
+        assert log.getvalue().count("WARNING: source_latent_a is 64x64px, larger than the picture drawn") == warns, sampled
 
 
 if __name__ == "__main__":

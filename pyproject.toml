@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-krea2edit-advanced"
 description = "Chained, mask-limited instruction edits for Krea 2 in ComfyUI. A fork of comfyui-krea2edit with a source hold that keeps unedited areas steady."
-version = "3.0.0"
+version = "3.1.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"

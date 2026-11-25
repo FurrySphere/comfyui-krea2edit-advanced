@@ -95,7 +95,7 @@ def test_the_hold_acts_inside_the_edit_area_and_the_flat_pull_outside_it():
     x0, ref = torch.zeros(1, 4, 8, 8), torch.ones(1, 4, 8, 8)
     flat, hold = mod.Guide(mod.GuideConfig(early_hold=0.7), SIG).plan[0][0], mod.Guide(mod.GuideConfig(early_hold=0.7), SIG).hold[0]
     for m in (0.0, 0.25, 0.5, 1.0):
-        out = mod.Guide(mod.GuideConfig(early_hold=0.7), SIG).apply(SIG[0], x0, ref, torch.full((1, 1, 8, 8), m))
+        out = mod.Guide(mod.GuideConfig(early_hold=0.7), SIG).apply(SIG[0], x0, ref, torch.full((1, 1, 8, 8), m), torch.ones(1, 1, 8, 8))
         assert torch.allclose(out, torch.full_like(out, m * flat + (1 - m) * hold)), m
 
 
@@ -144,38 +144,156 @@ def test_shrink_is_the_grow_of_the_background_and_leaves_the_image_border_alone(
     mod = _load_pack()
     left = torch.zeros(1, 40, 60)
     left[:, :, :30] = 1.0                                             # white from the left border to the middle
-    out = mod._edit_mask(left, (40, 60), -10.0, 0.0)                   # 10% of the short side = 4 px
+    out = mod._edit_mask(left, (0, 0, 40, 60), (40, 60), -10.0, 0.0)   # 10% of the short side = 4 px
     assert (out[0, :, 0] == 1).all()                                   # the border is not a mask edge
     assert float(out[0, 20, 25]) == 1.0 and float(out[0, 20, 26]) == 0.0
-    assert (mod._edit_mask(None, (40, 60), -100.0, 0.0) == 1).all()    # no mask stays all white, however far it shrinks
+    assert (mod._edit_mask(None, (0, 0, 40, 60), (40, 60), -100.0, 0.0) == 1).all()    # no mask stays all white, however far it shrinks
 
 
 def test_grow_moves_the_edge_by_the_percentage_of_the_short_side():
     mod = _load_pack()
     box = torch.zeros(1, 100, 200)
     box[:, 40:60, 80:120] = 1.0
-    out = mod._edit_mask(box, (100, 200), 10.0, 0.0)                   # 10 px
+    out = mod._edit_mask(box, (0, 0, 100, 200), (100, 200), 10.0, 0.0)  # 10 px
     assert float(out[0, 50, 129]) == 1.0 and float(out[0, 50, 130]) == 0.0
     assert float(out[0, 30, 100]) == 1.0 and float(out[0, 29, 100]) == 0.0
 
 
-def test_feather_blurs_the_edge_and_keeps_the_values_in_range():
+def test_feather_fades_only_outside_the_white_and_keeps_the_values_in_range():
     mod = _load_pack()
     left = torch.zeros(1, 80, 80)
-    left[:, :, :40] = 1.0
-    out = mod._edit_mask(left, (80, 80), 0.0, 5.0)                     # sigma 4 px
+    left[:, :, :40] = 1.0                                              # white up to column 39
+    out = mod._edit_mask(left, (0, 0, 80, 80), (80, 80), 0.0, 5.0)     # a fade 4 px long
     row = out[0, 40]
     assert float(out.min()) >= 0.0 and float(out.max()) <= 1.0
-    assert 0.45 < float(row[39]) < 0.7 and float(row[30]) > 0.97 and float(row[50]) < 0.03
+    assert (row[:40] > 0.99).all()                                     # the white stays white
+    assert float(row[40]) > 0.95 and float(row[44]) < 0.02             # the fade lies in the next 4 px
     assert bool((row[1:] <= row[:-1] + 1e-6).all())                    # one smooth ramp
+
+
+def test_a_negative_feather_fades_inside_the_white_and_lights_nothing_outside():
+    mod = _load_pack()
+    left = torch.zeros(1, 80, 80)
+    left[:, :, :40] = 1.0                                              # white up to column 39
+    out = mod._edit_mask(left, (0, 0, 80, 80), (80, 80), 0.0, -5.0)    # a fade 4 px long, inwards
+    row = out[0, 40]
+    assert float(out.min()) >= 0.0 and float(out.max()) <= 1.0
+    assert (row[40:] == 0).all() and float(row[39]) < 0.05             # nothing lit outside, the edge itself is dark
+    assert float(row[35]) > 0.95 and (row[:34] > 0.99).all()           # the fade lies in the last 4 px of the white
+    assert bool((row[1:] <= row[:-1] + 1e-6).all())
+
+
+def test_positive_and_negative_feather_are_mirror_images_around_the_same_edge():
+    """Outwards the fade starts at the white's edge, inwards it ends there: the two ramps cover the 12 px on either side of it."""
+    mod = _load_pack()
+    box = torch.zeros(1, 200, 400)
+    box[:, 50:150, 100:300] = 1.0                                      # white from column 100 to 299, a large box
+    out = mod._edit_mask(box, (0, 0, 200, 400), (200, 400), 0.0, 6.0)[0, 100]      # 6% of 200 = a 12 px fade
+    inn = mod._edit_mask(box, (0, 0, 200, 400), (200, 400), 0.0, -6.0)[0, 100]
+    assert (out[100:300] > 0.99).all() and float(out[88]) < 0.05 and 0.4 < float(out[94]) < 0.6
+    assert (inn[:88] == 0).all() and (inn[112:288] > 0.99).all() and 0.4 < float(inn[106]) < 0.6
+    assert float(inn[99]) < 0.01 and float(inn[100]) < 0.01
+
+
+def test_a_negative_feather_is_a_positive_one_with_the_edge_moved_in():
+    """The edge moves by grow + feather / 2 for either sign: feather -f with grow g is feather f with grow g - f."""
+    mod = _load_pack()
+    box = torch.zeros(1, 200, 400)
+    box[:, 50:150, 100:300] = 1.0
+    a = mod._edit_mask(box, (0, 0, 200, 400), (200, 400), 2.0, -6.0)
+    b = mod._edit_mask(box, (0, 0, 200, 400), (200, 400), -4.0, 6.0)
+    assert torch.allclose(a, b, atol=1e-6)                             # the same shifted edge and the same blur
+
+
+def test_grow_and_feather_add_up_to_the_same_edge_as_the_grow_alone():
+    """The fade is placed behind the grown white: the 50 % point sits half a feather beyond the grown edge."""
+    mod = _load_pack()
+    box = torch.zeros(1, 100, 200)
+    box[:, 40:60, 80:120] = 1.0
+    hard = mod._edit_mask(box, (0, 0, 100, 200), (100, 200), 10.0, 0.0)[0, 50]          # white from column 70 to 129
+    soft = mod._edit_mask(box, (0, 0, 100, 200), (100, 200), 10.0, 10.0)[0, 50]         # a fade of 10 px behind it
+    assert (soft[70:130] > 0.99).all() and float(hard[130]) == 0.0
+    assert 0.3 < float(soft[134]) < 0.7 and 0.3 < float(soft[135]) < 0.7 and float(soft[141]) < 0.02
 
 
 def test_a_mask_of_another_resolution_is_resized_to_the_pixel_grid():
     mod = _load_pack()
     small = torch.zeros(1, 10, 10)
     small[:, :, 5:] = 1.0
-    out = mod._edit_mask(small, (80, 120), 0.0, 0.0)
+    out = mod._edit_mask(small, (0, 0, 80, 120), (80, 120), 0.0, 0.0)
     assert out.shape == (1, 80, 120) and float(out[0, 40, 10]) < 0.1 and float(out[0, 40, 110]) > 0.9
+
+
+# ---------------------------------------------------------------- outside the source
+
+BAND = (0, 360, 1024, 816)                                             # a tall source centered in a 1536 x 1024 picture
+CANVAS = (1024, 1536)
+
+
+def test_everything_outside_the_source_is_edit_area_and_the_band_follows_the_drawn_mask():
+    mod = _load_pack()
+    black = torch.zeros(1, 64, 51)                                     # the whole source is kept
+    out = mod._edit_mask(black, BAND, CANVAS, 0.0, 0.0)
+    assert (out[0, :, :360] == 1).all() and (out[0, :, 1176:] == 1).all()
+    assert (out[0, :, 360:1176] == 0).all()
+    assert (mod._edit_mask(torch.ones(1, 64, 51), BAND, CANVAS, 5.0, 5.0) == 1).all()         # a white mask stays white
+    assert (mod._edit_mask(None, BAND, CANVAS, -50.0, 20.0) == 1).all()                      # and so does no mask
+
+
+def test_the_outside_grows_over_the_source_and_fades_into_it():
+    mod = _load_pack()
+    black = torch.zeros(1, 64, 51)
+    row = mod._edit_mask(black, BAND, CANVAS, 2.0, 3.0)[0, 512]       # grow 20 px, then a fade of 30 px
+    assert (row[:360] == 1).all() and (row[360:380] > 0.99).all()     # white outside, grown over the border
+    assert 0.4 < float(row[395]) < 0.6 and float(row[420]) < 0.02      # 50 % half the fade beyond the grown edge
+    assert float(row[1175]) == float(mod._edit_mask(black, BAND, CANVAS, 2.0, 3.0)[0, 512, 361])    # symmetric on the right
+    out = mod._edit_mask(black, BAND, CANVAS, 2.0, 3.0)
+    assert float(out[0, 0, 700]) == 0.0 and float(out[0, 1023, 700]) == 0.0    # the source touches the top and bottom: no fade there
+
+
+def test_a_negative_grow_does_not_pull_the_outside_into_the_kept_source():
+    mod = _load_pack()
+    black = torch.zeros(1, 64, 51)
+    out = mod._edit_mask(black, BAND, CANVAS, -3.0, 0.0)
+    assert (out[0, :, :360] == 1).all() and (out[0, :, 1176:] == 1).all()     # still free outside
+    assert (out[0, :, 360:1176] == 0).all()                                    # the source is kept right up to its border
+
+
+def test_an_area_inside_the_source_shrinks_and_fades_like_any_mask():
+    mod = _load_pack()
+    drawn = torch.zeros(1, 1024, 816)
+    drawn[:, 320:640, 240:560] = 1.0                                           # a white box inside the source, drawn at its size
+    out = mod._edit_mask(drawn, BAND, CANVAS, -1.0, 0.0)                       # shrunk by 10 px
+    plain = mod._edit_mask(drawn, BAND, CANVAS, 0.0, 0.0)
+    assert float(plain[0, 512, 603]) == 1.0 and float(out[0, 512, 603]) == 0.0         # the box starts at 360 + 240 = 600
+    assert float(out[0, 512, 760]) == 1.0
+
+
+# ---------------------------------------------------------------- the picture the VAE kept
+
+def test_the_vae_crop_is_reproduced_for_a_mask_of_the_picture_size():
+    """The mask is cut like ComfyUI's own VAE crop cuts the picture: a ramp that records its own coordinates survives it identically."""
+    import types
+    import comfy.sd
+    mod = _load_pack()
+    vae = types.SimpleNamespace(crop_input=True, spacial_compression_encode=lambda: 8, output_channels=3, pad_channel_value=None)
+    for h, w in ((890, 720), (896, 720), (893, 723), (895, 727), (1000, 1000)):
+        rows = torch.arange(h, dtype=torch.float32)[:, None].expand(h, w)
+        cols = torch.arange(w, dtype=torch.float32)[None, :].expand(h, w)
+        picture = torch.stack([rows, cols, rows], -1)[None]
+        kept = comfy.sd.VAE.vae_encode_crop_pixels(vae, picture)
+        cells = (kept.shape[1] // 8, kept.shape[2] // 8)
+        cropped = mod._crop_like_vae(rows[None], cells)
+        assert cropped.shape[-2:] == kept.shape[1:3] and torch.equal(cropped[0], kept[0, ..., 0]), (h, w)
+        assert torch.equal(mod._crop_like_vae(cols[None], cells)[0], kept[0, ..., 1]), (h, w)
+
+
+def test_a_mask_of_another_size_is_kept_whole():
+    mod = _load_pack()
+    m = torch.rand(1, 300, 200)
+    assert mod._crop_like_vae(m, (111, 90)) is m or torch.equal(mod._crop_like_vae(m, (111, 90)), m)
+    assert mod._crop_like_vae(None, (111, 90)) is None
+
 
 
 # ---------------------------------------------------------------- what the node installs
@@ -190,7 +308,7 @@ class _Patcher(_FakeModelPatcher):
 def _run(mod, **kw):
     """Run the node with add_guidance replaced by a recorder: returns (the call, the node's outputs)."""
     calls = []
-    mod.add_guidance = lambda m, cfg, source, mask: calls.append((cfg, source, mask))
+    mod.add_guidance = lambda m, cfg, place: calls.append((cfg, place))
     out = mod.Krea2EditAdvanced.execute(_Patcher(), {"samples": torch.zeros(1, 4, 8, 12)}, **kw)
     return calls, out
 
@@ -202,7 +320,7 @@ def _aligned(**kw):
 def test_the_hold_is_installed_with_the_fixed_settings_and_the_knob():
     mod = _load_pack()
     calls, _ = _run(mod, ref_position_a=_aligned(hold_strength=1.3))
-    (cfg, _, _), = calls
+    (cfg, _), = calls
     assert cfg.early_hold == 1.3
     assert cfg == mod.GuideConfig(early_hold=1.3)
 
@@ -218,8 +336,8 @@ def test_the_hold_is_off_when_the_switch_is_off_or_the_source_is_not_aligned():
 def test_without_a_mask_everything_is_the_edit_area_and_nothing_is_held_by_the_mask():
     mod = _load_pack()
     calls, (_, mask) = _run(mod, ref_position_a=_aligned())
-    (_, _, hold), = calls
-    assert mask.shape == (1, 64, 96) and (mask == 1).all() and (hold == 0).all()       # source is 8 x 12 latent cells = 64 x 96 pixels
+    (_, place), = calls
+    assert mask.shape == (1, 64, 96) and (mask == 1).all() and (place((8, 12))[1] == 1).all()       # source is 8 x 12 latent cells = 64 x 96 pixels
 
 
 def test_the_hold_mask_is_the_complement_of_the_grown_and_feathered_edit_mask_that_is_also_returned():
@@ -227,18 +345,32 @@ def test_the_hold_mask_is_the_complement_of_the_grown_and_feathered_edit_mask_th
     drawn = torch.zeros(1, 32, 48)
     drawn[:, 8:24, 12:36] = 1.0
     calls, (_, mask) = _run(mod, ref_position_a=_aligned(edit_mask=drawn, grow_percent=10.0, feather_percent=5.0))
-    (_, _, hold), = calls
-    assert torch.equal(mask, mod._edit_mask(drawn, (64, 96), 10.0, 5.0)) and torch.allclose(hold, 1 - mask)
+    (_, place), = calls
+    expected = mod._edit_mask(drawn, (0, 0, 64, 96), (64, 96), 10.0, 5.0)
+    assert torch.equal(mask, expected) and torch.equal(place((8, 12))[1], expected)
 
 
 def test_the_reference_is_the_source_fitted_to_the_sampled_grid():
     mod = _load_pack()
     calls, _ = _run(mod, ref_position_a=_aligned())
-    (_, source, hold), = calls
-    placed, weight = mod._place_ref(source, hold, 8, 12)
-    assert placed.shape == (1, 4, 8, 12) and weight.shape == (1, 1, 8, 12)
-    placed, _ = mod._place_ref(source, hold, 8, 8)                     # a different sampled size: the same crop the attention path uses
+    (_, place), = calls
+    placed, edit, valid = place((8, 12))
+    assert placed.shape == (1, 4, 8, 12) and edit.shape == (1, 64, 96) and valid.shape == (1, 1, 8, 12) and (valid == 1).all()
+    placed, _, _ = place((8, 8))                                       # a smaller sampled size: the same crop the attention path uses
     assert placed.shape == (1, 4, 8, 8)
+    placed, edit, valid = place((12, 12))                              # a larger one: the source keeps its size, centered
+    assert placed.shape == (1, 4, 12, 12) and edit.shape == (1, 96, 96)
+    assert valid[0, 0, :, 0].tolist() == [0, 0] + [1] * 8 + [0, 0] and valid[0, 0, 5].tolist() == [1] * 12
+    assert (edit[:, :16] == 1).all() and (edit[:, 80:] == 1).all()     # the picture above and below the source is edit area
+
+
+def test_the_mask_output_has_the_size_of_the_target_latent_when_it_is_connected():
+    mod = _load_pack()
+    drawn = torch.zeros(1, 32, 48)
+    calls, (_, mask) = _run(mod, ref_position_a=_aligned(edit_mask=drawn, ref_x_percent=0.0, ref_y_percent=100.0),
+                            target_latent={"samples": torch.zeros(1, 4, 12, 20)})
+    assert mask.shape == (1, 96, 160)
+    assert (mask[:, :32] == 1).all() and (mask[:, 32:, :96] == 0).all() and (mask[:, 32:, 96:] == 1).all()      # source 64 x 96 px at the bottom left
 
 
 def test_the_real_hold_registers_its_sampler_hooks():
@@ -246,7 +378,7 @@ def test_the_real_hold_registers_its_sampler_hooks():
     import comfy.patcher_extension as pe
     import test_guide_hooks as hooks
     opts = hooks._Opts()
-    mod.add_guidance(opts, mod.GuideConfig(), torch.ones(1, 4, 8, 8), torch.ones(1, 64, 64))
+    mod.add_guidance(opts, mod.GuideConfig(), None)
     assert "sampler_post_cfg_function" in opts.model_options
     assert "krea2_edit_advanced_guide" in opts.model_options["transformer_options"]["wrappers"][pe.WrappersMP.SAMPLER_SAMPLE]
 

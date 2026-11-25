@@ -17,6 +17,7 @@ Wiring:  LoadImage -> VAEEncode(source) --\
          UNETLoader -> LoraLoaderModelOnly -/
 KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
 """
+import functools
 import math
 from dataclasses import dataclass
 
@@ -32,11 +33,12 @@ from comfy.ldm.modules.attention import optimized_attention_masked
 from comfy_api.latest import ComfyExtension, io
 
 
-def _imgids(bs, frame, h_, w_, device):
+def _imgids(bs, frame, h_, w_, device, oy=0.0, ox=0.0):
+    """RoPE ids of an h_ x w_ token grid whose top left token sits at (oy, ox) tokens of the target."""
     ids = torch.zeros(h_, w_, 3, device=device, dtype=torch.float32)
     ids[..., 0] = frame
-    ids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
-    ids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
+    ids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None] + oy
+    ids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :] + ox
     return ids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
 
 
@@ -83,14 +85,6 @@ def _to_4d(v):
     return v
 
 
-def _fit_box(ih, iw, px_h, px_w):
-    """Window (y0, x0, h, w) of an ih x iw source that is cropped, centered, to the aspect ratio of a px_h x px_w target.
-    Source latents and their boost masks follow this one geometry."""
-    s = max(px_h / ih, px_w / iw)
-    ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
-    return (ih - ch) // 2, (iw - cw) // 2, ch, cw
-
-
 def _crop_mask(mask, ih, iw, box):
     """Crop a MASK drawn on an ih x iw source to `box` (y0, x0, h, w) of that source. The mask may
     have a different resolution than the source it was drawn on."""
@@ -101,32 +95,63 @@ def _crop_mask(mask, ih, iw, box):
     return mask[..., ya:yb, xa:xb]
 
 
-def _fit_src(src, H, W):
-    """Fit a source latent to the target grid the way TRAINING did: center-crop to
-    the target aspect ratio, then resize. A plain interpolate (the pre-fix behavior)
-    STRETCHES mixed-AR sources — users saw stretched people whenever their input AR
-    differed from the output resolution."""
-    sh, sw = src.shape[-2:]
-    if (sh, sw) == (H, W):
-        return src
-    y0, x0, ch, cw = _fit_box(sh, sw, H, W)
-    src = src[..., y0:y0 + ch, x0:x0 + cw]
-    return F.interpolate(src.float(), size=(H, W), mode="bilinear")
+def _pad(n):
+    """n latent cells padded to whole tokens."""
+    return -(-n // TOKEN) * TOKEN
 
 
-def _place_ref(ref, mask, H, W):
-    """Reference a on the target's latent grid: padded to whole tokens and fitted like krea2_edit_forward fits a
-    source. Returns the reference and the mask (drawn on the reference) averaged onto that grid, cropped to H x W."""
-    Hp, Wp = -(-H // TOKEN) * TOKEN, -(-W // TOKEN) * TOKEN
-    ref = comfy.ldm.common_dit.pad_to_patch_size(_to_4d(ref), (TOKEN, TOKEN), padding_mode="replicate")
-    if ref.shape[-2:] != (Hp, Wp):
-        mask = _crop_mask(mask, *ref.shape[-2:], _fit_box(*ref.shape[-2:], Hp, Wp))
-        ref = _fit_src(ref, Hp, Wp)
-    weight = F.interpolate((mask if mask.ndim == 3 else mask[None])[:1][None].float(), size=(Hp, Wp), mode="area")
-    return ref[..., :H, :W], weight[..., :H, :W]
+def _axis(s, t, percent):
+    """One axis of a source of s latent cells on a picture of t cells (a whole number of tokens): (first source cell used,
+    cells used, offset in the picture). A source that fits keeps its size and sits `percent` of the free space in. A larger
+    one keeps its size too and is cut to the picture, at `percent` of the surplus. Whole cells either way, so 50 % of an even
+    difference is half a token."""
+    if _pad(s) <= t:
+        return 0, s, round(percent / 100 * (t - _pad(s)))
+    return round(percent / 100 * (s - t)), t, 0
 
 
-DISC = 24          # largest disc radius (pixels) filtered exactly; a larger one is filtered on a coarser grid
+def _window(src_hw, size, x_percent, y_percent):
+    """Where a source of src_hw cells meets a picture of `size` cells: the part of the source that is used, as (y0, x0, h, w),
+    and where it sits in the picture, as (down, right) in cells. Latent and masks follow this one window."""
+    (y0, h, oy), (x0, w, ox) = _axis(src_hw[0], _pad(size[0]), y_percent), _axis(src_hw[1], _pad(size[1]), x_percent)
+    return (y0, x0, h, w), (oy, ox)
+
+
+def _vae_window(n, cells):
+    """(offset, length) of the part of an n pixel axis that the VAE kept to make `cells` latent cells. It crops a picture to a
+    multiple of 8 pixels, centered, the odd pixel at the end. Another n is not a picture of this latent: it is kept whole."""
+    return ((n % 8) // 2, cells * 8) if cells * 8 <= n < cells * 8 + 8 else (0, n)
+
+
+def _crop_like_vae(mask, cells):
+    """A MASK drawn on the picture a latent of `cells` = (h, w) was encoded from, cropped like the VAE cropped the picture."""
+    if mask is None:
+        return None
+    (y, h), (x, w) = (_vae_window(n, c) for n, c in zip(mask.shape[-2:], cells))
+    return mask[..., y:y + h, x:x + w]
+
+
+def _place_ref(ref, mask, x_percent, y_percent, grow_percent, feather_percent, size):
+    """Reference a on the target's latent grid `size` = (H, W): placed like krea2_edit_forward places it (see _window).
+    Returns the reference, the edit area on the pixel grid (see _edit_mask; the drawn `mask` is on the whole reference) and
+    the cells that show the reference, all cropped to the target."""
+    H, W = size
+    Hp, Wp = _pad(H), _pad(W)
+    ref = _to_4d(ref)
+    box, (oy, ox) = _window(ref.shape[-2:], size, x_percent, y_percent)
+    y0, x0, hs, ws = box
+    if mask is not None and (hs, ws) != tuple(ref.shape[-2:]):
+        mask = _crop_mask(mask, *ref.shape[-2:], box)
+    ref = ref[..., y0:y0 + hs, x0:x0 + ws]
+    placed = ref.new_zeros(1, ref.shape[1], Hp, Wp)
+    placed[..., oy:oy + hs, ox:ox + ws] = ref[:1]
+    valid = ref.new_zeros(1, 1, Hp, Wp)
+    valid[..., oy:oy + hs, ox:ox + ws] = 1
+    edit = _edit_mask(mask, (oy * 8, ox * 8, hs * 8, ws * 8), (Hp * 8, Wp * 8), grow_percent, feather_percent)
+    return placed[..., :H, :W], edit[..., :H * 8, :W * 8], valid[..., :H, :W]
+
+
+DISC = 24         # largest disc radius (pixels) filtered exactly; a larger one is filtered on a coarser grid
 
 
 def _disc_max(m, r):
@@ -165,18 +190,25 @@ def _gaussian(m, sigma):
     return m if f == 1 else F.interpolate(m, size=(h, w), mode="bilinear")
 
 
-def _edit_mask(mask, size, grow_percent, feather_percent):
-    """The edit area on the pixel grid `size` = (h, w): the drawn MASK (white everywhere without one) grown (positive) or shrunk
-    (negative) by a disc, then feathered; both in percent of the shorter side. Returns (1, h, w) in 0..1."""
+def _edit_mask(mask, band, size, grow_percent, feather_percent):
+    """The edit area on the pixel grid `size` = (h, w), 1 = the picture may change. The drawn MASK (white without one) covers
+    the `band` = (y, x, h, w) where the source is; everywhere else is white. The white is grown (positive) or shrunk (negative)
+    by a disc, in percent of the shorter side, and the edge is faded over the feather's length (same percent): outwards for
+    a positive feather (the white itself is never softened), inwards for a negative one (nothing outside the grown white
+    is lit). Outside the band stays white. Returns (1, h, w) in 0..1."""
+    y, x, bh, bw = band
     h, w = size
+    edit = torch.ones(1, 1, h, w)
     if mask is None:
-        m = torch.ones(1, 1, h, w)
-    else:
-        m = (mask if mask.ndim == 3 else mask[None])[:1][None].float()
-        m = F.interpolate(m, size=(h, w), mode="area" if m.shape[-2] >= h else "bilinear")
-    r = grow_percent * min(h, w) / 100
-    m = _disc_max(m, round(r)) if r > 0 else 1 - _disc_max(1 - m, round(-r))
-    return _gaussian(m, feather_percent * min(h, w) / 100).clamp(0, 1)[0]
+        return edit[0]
+    m = (mask if mask.ndim == 3 else mask[None])[:1][None].float()
+    edit[..., y:y + bh, x:x + bw] = F.interpolate(m, size=(bh, bw), mode="area" if m.shape[-2] >= bh else "bilinear")
+    side = min(h, w) / 100
+    r = (grow_percent + feather_percent / 2) * side
+    m = _disc_max(edit, round(r)) if r > 0 else 1 - _disc_max(1 - edit, round(-r))
+    m = _gaussian(m, abs(feather_percent) / 6 * side)
+    edit[..., y:y + bh, x:x + bw] = m[..., y:y + bh, x:x + bw]
+    return edit.clamp(0, 1)[0]
 
 
 def _ref_attn_bias(boosts, masks, txtlen, slens, tgtlen, mask_hw, device, dtype):
@@ -209,7 +241,8 @@ def _ref_attn_bias(boosts, masks, txtlen, slens, tgtlen, mask_hw, device, dtype)
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost_a=1.0, ref_boost_b=1.0, ref_boost_mask_a=None, ref_boost_mask_b=None,
-                       ref_position_a="aligned (trained)", ref_position_b="aligned (trained)"):
+                       ref_position_a="aligned (trained)", ref_position_b="aligned (trained)",
+                       ref_x_percent=50.0, ref_y_percent=50.0):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -217,6 +250,9 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     src_latent  : clean SOURCE latent (VAE-encoded), 4D/5D — or a LIST of them
                   (multi-ref: [a, b] = [scene, subject], frames 1..N, training-matched).
                   The *_a controls always act on the first entry, the *_b controls on the second.
+                  A source keeps its size. One that fits inside the target sits at ref_x_percent / ref_y_percent of the
+                  free space (the others centered) and the target tokens around it have no source; a larger one is cut to
+                  the target, at the same percentages of the surplus.
     context     : (B, seq, txtlayers*txtdim) — the 12-layer Qwen3-VL stack
     """
     patch = m.patch
@@ -232,21 +268,21 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     H, W = x.shape[-2], x.shape[-1]
     h_, w_ = H // patch, W // patch
 
-    # source(s) -> (bs, C, H, W): flatten temporal, match batch, fit to the target grid
-    # (center-crop to target AR then resize — training-matched; never stretch).
+    # source(s) -> (bs, C, H, W): flatten temporal, match batch, cut to the part that is inside the target (see _window)
     src_list = src_latent if isinstance(src_latent, (list, tuple)) else [src_latent]
+    shares = [(ref_x_percent, ref_y_percent)] + [(50.0, 50.0)] * (len(src_list) - 1)
     masks = [ref_boost_mask_a, ref_boost_mask_b]
-    srcs = []
-    for i, sl in enumerate(src_list):
+    srcs, offsets = [], []
+    for i, (sl, (x_percent, y_percent)) in enumerate(zip(src_list, shares)):
         src = _to_4d(sl).to(x.device, x.dtype)
         if src.shape[0] != bs:
             src = src[:1].expand(bs, *src.shape[1:])
-        if src.shape[-2:] != (H, W):
-            sh, sw = src.shape[-2:]
-            if masks[i] is not None:
-                masks[i] = _crop_mask(masks[i], sh, sw, _fit_box(sh, sw, H, W))
-            src = _fit_src(src, H, W).to(x.dtype)
-        srcs.append(comfy.ldm.common_dit.pad_to_patch_size(src, (patch, patch), padding_mode="replicate"))
+        box, offset = _window(src.shape[-2:], (H, W), x_percent, y_percent)
+        y0, x0, h, w = box
+        if masks[i] is not None and (h, w) != tuple(src.shape[-2:]):
+            masks[i] = _crop_mask(masks[i], *src.shape[-2:], box)
+        srcs.append(comfy.ldm.common_dit.pad_to_patch_size(src[..., y0:y0 + h, x0:x0 + w], (patch, patch), padding_mode="replicate"))
+        offsets.append(offset)
     src_grids = [(s_.shape[-2] // patch, s_.shape[-1] // patch) for s_ in srcs]
 
     context = m._unpack_context(context)                       # (B, seq, 12, 2560)
@@ -265,7 +301,7 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     combined = torch.cat([context] + src_imgs + [tgt_img], dim=1)  # [text | refs... | target]
 
     device = combined.device
-    ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
+    ref_ids = [_imgids(bs, i + 1, gh, gw, device, oy / patch, ox / patch) for i, ((gh, gw), (oy, ox)) in enumerate(zip(src_grids, offsets))]
     ref_ids = _place_refs(ref_ids, [ref_position_a, ref_position_b][:len(ref_ids)], h_, w_)
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]   # text @ 0
@@ -354,32 +390,33 @@ class Guide:
         s = float(torch.as_tensor(sigma).flatten()[0])
         return min(range(len(self.plan)), key=lambda i: abs(self.sigmas[i] - s))
 
-    def _distance_freedom(self, x0, ref):
+    def _distance_freedom(self, x0, ref, valid):
         cfg = self.cfg
         if cfg.dist_tau <= 0 or cfg.ref_guide >= 1:
             return 0.0
         if self.ref_std is None:
-            self.ref_std = ref.float().std()
+            self.ref_std = ref.float()[:, :, valid[0, 0] > 0].std()
         d = token_rms(x0, ref) / self.ref_std
         self.dist = d if self.dist is None else cfg.smooth * self.dist + (1 - cfg.smooth) * d
         tau = cfg.dist_tau * cfg.ref_guide / (1 - cfg.ref_guide)
         return self.dist.pow(cfg.dist_pow) / (self.dist.pow(cfg.dist_pow) + tau ** cfg.dist_pow)
 
-    def apply(self, sigma, x0, ref, mask):
-        """x0, ref: (B, C, H, W); mask: (1, 1, H, W) in 0..1, 1 = keep as the source, 0 = edit area."""
+    def apply(self, sigma, x0, ref, mask, valid):
+        """x0, ref: (B, C, H, W); mask, valid: (1, 1, H, W); mask in 0..1, 1 = keep as the source, 0 = edit area; valid = 1
+        where ref shows the source, 0 where it has nothing (no pull there)."""
         i = self.step_of(sigma)
         early, late = self.plan[i]
         hold = self.hold[i]
         if early == 0 and late == 0 and hold == 0:
             return x0
-        free = self._distance_freedom(x0, ref) * (1 - mask) if late > 0 else 0.0
-        w = late * (1 - free) + mask * early + (1 - mask) * hold
+        free = self._distance_freedom(x0, ref, valid) * (1 - mask) if late > 0 else 0.0
+        w = valid * (late * (1 - free) + mask * early + (1 - mask) * hold)
         return torch.lerp(x0, ref.to(x0.dtype), w.to(x0.dtype))
 
 
-def add_guidance(m, cfg, source, mask):
-    """Install the source hold on a patched model. `source` is the source latent (scaled like the target), `mask` the
-    hold weight on the pixel grid (1 = keep as the source)."""
+def add_guidance(m, cfg, place):
+    """Install the source hold on a patched model. place(size) puts the source on the sampled latent grid `size` and returns
+    the source (scaled like the target), the edit area on the pixel grid (1 = the picture may change) and the valid cells."""
     run = {}   # state of the current sampling call; dropped when it ends
 
     def sample(executor, guider, sigmas, *args):
@@ -398,9 +435,11 @@ def add_guidance(m, cfg, source, mask):
         x0 = _to_4d(denoised)
         size = tuple(x0.shape[-2:])
         if size not in run["placed"]:
-            run["placed"][size] = tuple(t.to(x0.device) for t in _place_ref(source, mask, *size))
-        ref, weight = run["placed"][size]
-        out = guide.apply(args["sigma"], x0, ref[:1].expand(x0.shape[0], -1, -1, -1), weight)
+            ref, edit, valid = place(size)
+            keep = 1 - F.interpolate(edit[None], size=size, mode="area")
+            run["placed"][size] = tuple(t.to(x0.device) for t in (ref, keep, valid))
+        ref, keep, valid = run["placed"][size]
+        out = guide.apply(args["sigma"], x0, ref[:1].expand(x0.shape[0], -1, -1, -1), keep, valid)
         return out.reshape(denoised.shape)
 
     m.set_model_sampler_post_cfg_function(post_cfg)
@@ -418,7 +457,7 @@ class Krea2EditAdvanced(io.ComfyNode):
             description="Lets a Krea 2 edit model see the source picture(s) while it draws and holds the picture to the source where the edit should not change it.",
             inputs=[
                 io.Model.Input("model"),
-                io.Latent.Input("source_latent_a", tooltip="The source picture, encoded with VAE Encode. The model sees it while it draws, and source_hold pulls the picture back to it. It must be the same size as the picture being drawn (the latent you give the sampler): otherwise it is cropped to the shape of the output and resized in latent space, which loses parts of the image and softens details, and with source_hold the softened version is pulled into the result. Scale the image to the output size before VAE Encode, or use the encoded source as the sampler's latent."),
+                io.Latent.Input("source_latent_a", tooltip="The source picture, encoded with VAE Encode. The model sees it while it draws, and source_hold pulls the picture back to it. If it is smaller than the picture being drawn (the latent you give the sampler) it keeps its size and is placed inside the picture, where ref_x_percent and ref_y_percent say, and the rest of the picture is drawn freely: this outpaints the source. Scale the image to the size you want before VAE Encode. If it is larger than the picture in either direction it keeps its size too and only the part that fits is used, where ref_x_percent and ref_y_percent say; scale the image to the output size to use all of it."),
                 io.Latent.Input("source_latent_b", optional=True, tooltip="Optional second source picture, for example a person to put into the scene. The model sees it next to source A; the source hold does not use it. Needs a LoRA trained for two sources."),
                 io.Float.Input("ref_boost_a", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="How closely the drawing follows the look of source A. 1 = normal. Higher = sticks closer to the source's details (too high copies the source and weakens the edit), lower = looser. Applies to all of source A, or only to the part marked in ref_boost_mask_a."),
                 io.Float.Input("ref_boost_b", default=1.0, min=0.0, max=1000.0, step=0.01, round=0.001, optional=True, tooltip="The same for source B. No effect without source B. 1 = normal."),
@@ -428,22 +467,26 @@ class Krea2EditAdvanced(io.ComfyNode):
                     io.DynamicCombo.Option(REF_POSITIONS[0], [
                         io.Boolean.Input("source_hold", default=True, tooltip="Pulls the picture back towards source A while it is drawn, wherever the edit should not change it. Off = no pull, the model alone decides, which can shift the picture by a pixel or two and darken it. If you plan several edits in a row, pass the output latent of one step as the source of the next. Works on the whole picture."),
                         io.Float.Input("hold_strength", default=0.7, min=0.0, max=10.0, step=0.05, tooltip="How firmly the edit area stays close to source A early in the drawing, while the layout forms. The edit area is the white part of edit_mask, or the whole picture when there is no mask; outside the mask the source is always held firmly. Higher = steadier picture (less shift, darkening or texture change) but smaller, more source-bound edits; lower = more freedom for the edit. 0.7 is a balance. At 0.5 the picture still drifts noticeably; at 4 added objects come out about half as big. 0 = no extra hold in the edit area."),
-                        io.Mask.Input("edit_mask", optional=True, tooltip="Where the picture may change: white = edit area, black = keep as the source, gray = partly. Draw it on the source image, any resolution. Without a mask the whole picture is the edit area. Krea 2 does not use the mask to choose where objects appear, so say where in the prompt. Best workflow: run once without a mask to see where Krea 2 puts the object, then draw the mask there and run again."),
-                        io.Float.Input("grow_percent", default=0.0, min=-100.0, max=100.0, step=0.5, tooltip="Makes the white area of edit_mask (where the edit may change the picture) bigger (positive) or smaller (negative) all around its edge, in percent of the shorter side of the picture. 0 = the mask as drawn."),
-                        io.Float.Input("feather_percent", default=0.0, min=0.0, max=100.0, step=0.5, tooltip="Softens the edge of the white area of edit_mask, in percent of the shorter side of the picture, after growing or shrinking. 0 = hard edge."),
+                        io.Mask.Input("edit_mask", optional=True, tooltip="Where the picture may change: white = edit area, black = keep as the source, gray = partly. Draw it on the source image, any resolution; at the size of the image you encoded it follows the VAE's crop to a multiple of 8 pixels exactly. Without a mask the whole source is the edit area, and so is everything outside the source. Krea 2 does not use the mask to choose where objects appear, so say where in the prompt. Best workflow: run once without a mask to see where Krea 2 puts the object, then draw the mask there and run again."),
+                        io.Float.Input("grow_percent", default=0.0, min=-100.0, max=100.0, step=0.5, tooltip="Makes the white area (where the edit may change the picture) bigger (positive) or smaller (negative) all around its edge, in percent of the shorter side of the picture. The area outside the source counts as white, so growing also eats into the source from its border. 0 = the mask as drawn."),
+                        io.Float.Input("feather_percent", default=0.0, min=-100.0, max=100.0, step=0.5, tooltip="Softens the edge of the white area outwards (positive) or inwards (negative), over this distance in percent of the shorter side of the picture. With a source smaller than the picture, grow plus half the feather below 0 ends the hold in a hard step at the source's border."),
+                        io.Float.Input("ref_x_percent", default=50.0, min=0.0, max=100.0, step=1.0, tooltip="Where source A sits across the picture when it is narrower than the picture: 0 = at the left edge, 50 = centered, the way the models were trained, 100 = at the right edge. The rest of the picture is drawn freely. When source A is wider than the picture, the same values choose which part of it is used: 0 = the left part, 50 = the middle, 100 = the right part. Values in between move it in proportion, in steps of one 8 px cell."),
+                        io.Float.Input("ref_y_percent", default=50.0, min=0.0, max=100.0, step=1.0, tooltip="Where source A sits down the picture when it is shorter than the picture: 0 = at the top edge, 50 = centered, the way the models were trained, 100 = at the bottom edge. The rest of the picture is drawn freely. When source A is taller than the picture, the same values choose which part of it is used: 0 = the top part, 50 = the middle, 100 = the bottom part. Values in between move it in proportion, in steps of one 8 px cell."),
                     ]),
                     io.DynamicCombo.Option(REF_POSITIONS[1], []),
                     io.DynamicCombo.Option(REF_POSITIONS[2], []),
                 ]),
                 io.Combo.Input("ref_position_b", options=REF_POSITIONS, default=REF_POSITIONS[0], optional=True, tooltip="The same choice for source B; no effect without source B. To put a person into a scene: A (the scene) aligned, B (the person) beside."),
+                io.Latent.Input("target_latent", optional=True, tooltip="The latent you give the sampler. Only used to give the MASK output the size of the picture being drawn; without it the mask has the size of source A, which is not the picture when source A is smaller."),
             ],
-            outputs=[io.Model.Output(), io.Mask.Output(tooltip="edit_mask as the node uses it, after growing and feathering (white = where the edit may change the picture; all white without edit_mask).")],
+            outputs=[io.Model.Output(), io.Mask.Output(tooltip="edit_mask as the node uses it, after growing and feathering, on the picture being drawn (connect target_latent for its size): white = where the edit may change the picture, which includes everything outside source A and the whole picture without edit_mask.")],
         )
 
     @classmethod
     def execute(cls, model, source_latent_a, ref_position_a, source_latent_b=None, ref_boost_a=1.0, ref_boost_b=1.0,
-                ref_boost_mask_a=None, ref_boost_mask_b=None, ref_position_b="aligned (trained)"):
+                ref_boost_mask_a=None, ref_boost_mask_b=None, ref_position_b="aligned (trained)", target_latent=None):
         position_a = ref_position_a["ref_position_a"]
+        x_percent, y_percent = ref_position_a.get("ref_x_percent", 50.0), ref_position_a.get("ref_y_percent", 50.0)
         if not (position_a.startswith("aligned") and ref_position_b.startswith("aligned")):
             print(f"[krea2edit] reference placement: a={position_a!r}, "
                   f"b={ref_position_b!r}", flush=True)
@@ -455,6 +498,9 @@ class Krea2EditAdvanced(io.ComfyNode):
             src = [src, model.model.process_latent_in(source_latent_b["samples"])]
 
         source_size = tuple(_to_4d(source_latent_a["samples"]).shape[-2:])
+        ref_boost_mask_a = _crop_like_vae(ref_boost_mask_a, source_size)
+        if source_latent_b is not None:
+            ref_boost_mask_b = _crop_like_vae(ref_boost_mask_b, tuple(_to_4d(source_latent_b["samples"]).shape[-2:]))
         warned = []
 
         def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
@@ -471,25 +517,28 @@ class Krea2EditAdvanced(io.ComfyNode):
                         transformer_options = a
                         break
             dm = executor.class_obj  # the SingleStreamDiT instance
-            if not warned and tuple(_to_4d(x).shape[-2:]) != source_size:
+            if not warned and any(_pad(a) > _pad(b) for a, b in zip(source_size, _to_4d(x).shape[-2:])):
                 warned.append(True)
-                print(f"[krea2edit] WARNING: source_latent_a is {source_size[1] * 8}x{source_size[0] * 8}px but the picture is drawn at "
-                      f"{x.shape[-1] * 8}x{x.shape[-2] * 8}px: the source is cropped and resized in latent space, which softens it. "
-                      f"Scale the image to the output size before VAE Encode.", flush=True)
+                print(f"[krea2edit] WARNING: source_latent_a is {source_size[1] * 8}x{source_size[0] * 8}px, larger than the picture drawn "
+                      f"({x.shape[-1] * 8}x{x.shape[-2] * 8}px) in at least one direction: only the part of it that fits is used "
+                      f"(ref_x_percent / ref_y_percent choose which). Scale the image to the output size before VAE Encode to use all of it.", flush=True)
             return krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
                                       ref_boost_a=ref_boost_a, ref_boost_b=ref_boost_b,
                                       ref_boost_mask_a=ref_boost_mask_a, ref_boost_mask_b=ref_boost_mask_b,
-                                      ref_position_a=position_a, ref_position_b=ref_position_b)
+                                      ref_position_a=position_a, ref_position_b=ref_position_b,
+                                      ref_x_percent=x_percent, ref_y_percent=y_percent)
 
         to = m.model_options.setdefault("transformer_options", {})
         comfy.patcher_extension.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_edit_advanced", wrapper, to
         )
-        h, w = _to_4d(source_latent_a["samples"]).shape[-2:]
-        edit = _edit_mask(ref_position_a.get("edit_mask"), (h * 8, w * 8), ref_position_a.get("grow_percent", 0.0), ref_position_a.get("feather_percent", 0.0))
+        place = functools.partial(_place_ref, src[0] if isinstance(src, list) else src,
+                                  _crop_like_vae(ref_position_a.get("edit_mask"), source_size), x_percent, y_percent,
+                                  ref_position_a.get("grow_percent", 0.0), ref_position_a.get("feather_percent", 0.0))
+        target = tuple(_to_4d((source_latent_a if target_latent is None else target_latent)["samples"]).shape[-2:])
         if ref_position_a.get("source_hold"):
-            add_guidance(m, GuideConfig(early_hold=ref_position_a["hold_strength"]), src[0] if isinstance(src, list) else src, 1 - edit)
-        return io.NodeOutput(m, edit)
+            add_guidance(m, GuideConfig(early_hold=ref_position_a["hold_strength"]), place)
+        return io.NodeOutput(m, place(target)[1])
 
 
 class Krea2EditAdvancedGroundedEncode(io.ComfyNode):

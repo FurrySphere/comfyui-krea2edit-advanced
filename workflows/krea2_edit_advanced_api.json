@@ -134,7 +134,7 @@
       "ref_position_a.source_hold": true,
       "ref_position_a.hold_strength": 0.7,
       "ref_position_a.grow_percent": 0.0,
-      "ref_position_a.feather_percent": 0.0
+      "ref_position_a.feather_percent": 0.0, "ref_position_a.ref_x_percent": 50.0, "ref_position_a.ref_y_percent": 50.0
     },
     "_meta": {
       "title": "Source patch"

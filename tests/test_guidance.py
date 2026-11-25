@@ -126,9 +126,9 @@ def test_early_gain_scales_only_the_early_phase():
 def test_late_only_guidance_leaves_the_early_steps_alone():
     x0, ref = _fields()
     g = _guide(ref_guide=0.8, late_gain=10.0, early_gain=0.0)
-    assert torch.equal(g.apply(EARLY, x0, ref, ONES), x0)
-    assert torch.allclose(g.apply(LATE, x0, ref, ONES), ref)                   # late strength saturates at 1
-    full_early = _guide(ref_guide=0.8, late_gain=10.0, early_gain=1.0).apply(EARLY, x0, ref, ONES)
+    assert torch.equal(g.apply(EARLY, x0, ref, ONES, VALID), x0)
+    assert torch.allclose(g.apply(LATE, x0, ref, ONES, VALID), ref)                   # late strength saturates at 1
+    full_early = _guide(ref_guide=0.8, late_gain=10.0, early_gain=1.0).apply(EARLY, x0, ref, ONES, VALID)
     assert torch.allclose(full_early, x0 + 0.8 * (ref - x0), atol=1e-6)
 
 
@@ -151,26 +151,27 @@ def _guide(sigmas=None, **cfg):
 
 ONES = torch.ones(1, 1, H, W)
 ZEROS = torch.zeros(1, 1, H, W)
+VALID = torch.ones(1, 1, H, W)
 LATE = 0.05          # a sigma well inside the late phase of _simple(10)
 EARLY = 0.95
 
 
 def test_zero_guidance_returns_the_estimate_untouched():
     x0, ref = _fields()
-    assert torch.equal(_guide(ref_guide=0.0).apply(LATE, x0, ref, ONES), x0)
+    assert torch.equal(_guide(ref_guide=0.0).apply(LATE, x0, ref, ONES, VALID), x0)
 
 
 def test_full_guidance_copies_the_reference():
     x0, ref = _fields()
     for sigma in (EARLY, LATE):
-        out = _guide(ref_guide=1.0, early_gain=1.0).apply(sigma, x0, ref, ONES)
+        out = _guide(ref_guide=1.0, early_gain=1.0).apply(sigma, x0, ref, ONES, VALID)
         assert torch.allclose(out, ref), sigma
 
 
 def test_guidance_is_proportional_to_the_mask_and_the_strength():
     x0, ref = _fields()
     mask = torch.full((1, 1, H, W), 0.5)
-    out = _guide(ref_guide=0.5, early_gain=1.0).apply(EARLY, x0, ref, mask)
+    out = _guide(ref_guide=0.5, early_gain=1.0).apply(EARLY, x0, ref, mask, VALID)
     assert torch.allclose(out, x0 + 0.25 * (ref - x0), atol=1e-6)
 
 
@@ -178,15 +179,36 @@ def test_the_edit_area_is_left_alone_in_the_early_phase():
     x0, ref = _fields()
     mask = torch.ones(1, 1, H, W)
     mask[..., :8] = 0
-    out = _guide(ref_guide=1.0, early_gain=1.0).apply(EARLY, x0, ref, mask)
+    out = _guide(ref_guide=1.0, early_gain=1.0).apply(EARLY, x0, ref, mask, VALID)
     assert torch.equal(out[..., :8], x0[..., :8])
     assert torch.allclose(out[..., 8:], ref[..., 8:])
 
 
 def test_output_keeps_the_estimate_dtype():
     x0, ref = _fields()
-    out = _guide(ref_guide=0.5).apply(EARLY, x0.bfloat16(), ref.bfloat16(), ONES)
+    out = _guide(ref_guide=0.5).apply(EARLY, x0.bfloat16(), ref.bfloat16(), ONES, VALID)
     assert out.dtype == torch.bfloat16
+
+
+def test_nothing_is_pulled_where_the_reference_shows_no_source():
+    x0, ref = _fields()
+    valid = VALID.clone()
+    valid[..., 8:] = 0
+    for sigma in (EARLY, LATE):
+        for mask in (ONES, ZEROS):                                           # held or edit area: no source means no pull either way
+            out = _guide(ref_guide=1.0, early_gain=1.0, dist_tau=0.0, early_hold=1.0).apply(sigma, x0, ref, mask, valid)
+            assert torch.equal(out[..., 8:], x0[..., 8:]), (sigma, float(mask.max()))
+            assert not torch.equal(out[..., :8], x0[..., :8])
+
+
+def test_the_distance_scale_comes_from_the_cells_that_show_the_source():
+    x0, ref = _fields()
+    ref[..., 8:] = 0.0
+    valid = VALID.clone()
+    valid[..., 8:] = 0
+    g = _guide(ref_guide=0.5, late_gain=1.0, dist_tau=1.0)
+    g.apply(LATE, x0, ref, ZEROS, valid)
+    assert math.isclose(float(g.ref_std), float(ref[..., :8].std()), rel_tol=1e-5)
 
 
 # ---------------------------------------------------------------- distance gate
@@ -205,7 +227,7 @@ def _pull_weight(dev, mask_value=0.0, **cfg):
     ref = torch.zeros(1, 4, H, W)
     ref[:, :, ::2, :] = 1.0                                                  # reference std = 0.5
     x0 = ref + dev
-    out = _guide(**{"smooth": 0.0, "late_gain": 1.0, "dist_pow": 2.0, **cfg}).apply(LATE, x0, ref, torch.full((1, 1, H, W), mask_value))
+    out = _guide(**{"smooth": 0.0, "late_gain": 1.0, "dist_pow": 2.0, **cfg}).apply(LATE, x0, ref, torch.full((1, 1, H, W), mask_value), VALID)
     return float(((out - x0) / (ref - x0)).mean())
 
 
@@ -247,10 +269,10 @@ def test_gate_steepness_sharpens_the_transition_around_the_tolerance():
 def test_distance_gate_is_off_at_zero_tau_and_in_the_early_phase():
     x0, ref = _two_zone(3.0)
     ref = ref + 1.0
-    off = _guide(ref_guide=0.5, late_gain=1.0, dist_tau=0.0).apply(LATE, x0, ref, ZEROS)
+    off = _guide(ref_guide=0.5, late_gain=1.0, dist_tau=0.0).apply(LATE, x0, ref, ZEROS, VALID)
     assert torch.allclose(off, x0 + 0.5 * (ref - x0), atol=1e-6)
-    gated_early = _guide(ref_guide=0.5, dist_tau=1.0, early_hold=1.0).apply(EARLY, x0, ref, ZEROS)
-    plain_early = _guide(ref_guide=0.5, dist_tau=0.0, early_hold=1.0).apply(EARLY, x0, ref, ZEROS)
+    gated_early = _guide(ref_guide=0.5, dist_tau=1.0, early_hold=1.0).apply(EARLY, x0, ref, ZEROS, VALID)
+    plain_early = _guide(ref_guide=0.5, dist_tau=0.0, early_hold=1.0).apply(EARLY, x0, ref, ZEROS, VALID)
     assert torch.allclose(gated_early, plain_early)
 
 
@@ -259,7 +281,7 @@ def test_distance_gate_tolerance_grows_with_the_guidance_strength():
     ref = ref + 1.0
     pulls = []
     for g in (0.3, 0.6, 0.9, 1.0):
-        out = _guide(ref_guide=g, late_gain=1.0, dist_tau=1.0, smooth=0.0).apply(LATE, x0, ref, ZEROS)
+        out = _guide(ref_guide=g, late_gain=1.0, dist_tau=1.0, smooth=0.0).apply(LATE, x0, ref, ZEROS, VALID)
         pulls.append(float(((out - x0) / (ref - x0))[..., 8:].mean()) / g)     # pull per unit of strength
     assert all(a < b for a, b in zip(pulls, pulls[1:])) and abs(pulls[-1] - 1.0) < 1e-5, pulls
 
@@ -269,9 +291,9 @@ def test_distance_memory_ignores_the_early_phase():
     x0, ref = _two_zone(0.0)
     ref = ref + 1.0
     g = _guide(ref_guide=0.5, dist_tau=0.5, smooth=0.5, early_hold=1.0)
-    g.apply(EARLY, x0 + 5.0, ref, ZEROS)
-    remembered = g.apply(LATE, x0, ref, ZEROS)
-    fresh = _guide(ref_guide=0.5, dist_tau=0.5, smooth=0.5, early_hold=1.0).apply(LATE, x0, ref, ZEROS)
+    g.apply(EARLY, x0 + 5.0, ref, ZEROS, VALID)
+    remembered = g.apply(LATE, x0, ref, ZEROS, VALID)
+    fresh = _guide(ref_guide=0.5, dist_tau=0.5, smooth=0.5, early_hold=1.0).apply(LATE, x0, ref, ZEROS, VALID)
     assert torch.equal(remembered, fresh)
 
 
@@ -280,10 +302,10 @@ def test_distance_smoothing_averages_across_steps():
     ref = ref + 1.0
     cfg = dict(ref_guide=0.5, late_gain=1.0, dist_tau=0.5, dist_pow=2.0, smooth=0.5)
     g = _guide(**cfg)
-    first = g.apply(LATE, x0, ref, ZEROS)
+    first = g.apply(LATE, x0, ref, ZEROS, VALID)
     far = x0 + 5.0
-    smoothed = g.apply(LATE, far, ref, ZEROS)
-    fresh = _guide(**cfg).apply(LATE, far, ref, ZEROS)
+    smoothed = g.apply(LATE, far, ref, ZEROS, VALID)
+    fresh = _guide(**cfg).apply(LATE, far, ref, ZEROS, VALID)
     assert (smoothed - far).abs().mean() > (fresh - far).abs().mean()         # remembers that it was close before
     assert first.shape == x0.shape
 
@@ -296,7 +318,7 @@ SIG = _simple(10)
 def test_each_run_has_its_own_state():
     a, b = _guide(ref_guide=0.5, dist_tau=1.0), _guide(ref_guide=0.5, dist_tau=1.0)
     x0, ref = torch.zeros(1, 4, H, W), torch.ones(1, 4, H, W)
-    a.apply(LATE, x0, ref, ZEROS)
+    a.apply(LATE, x0, ref, ZEROS, VALID)
     assert a.dist is not None and b.dist is None
 
 

@@ -1,7 +1,7 @@
-"""Pins how a source latent is cropped and resized to the target grid.
+"""Pins which part of a source latent is used for a picture and where it sits (see _window).
 
-Each golden is (first/last source row kept, first/last source column kept), read back from a ramp whose channels encode their own coordinates. The reference mask
-has to follow exactly this window, so this geometry must not drift.
+A source keeps its size. One that fits sits at x / y percent of the free space; a larger one is cut to the picture at the
+same percentages of the surplus. Latent and masks follow this one window, so it must not drift.
 
 Run standalone:  python tests/test_fit_geometry.py
 Or via pytest:   pytest tests/test_fit_geometry.py
@@ -17,31 +17,41 @@ if _HERE not in sys.path:
 
 from stubs import _load_pack   # noqa: E402
 
-
-def _window(c0, c1, ih, iw):
-    return (round(float(c1.min()) * (ih - 1)), round(float(c1.max()) * (ih - 1)),
-            round(float(c0.min()) * (iw - 1)), round(float(c0.max()) * (iw - 1)))
-
-
-# (source latent h, w, target latent h, w) -> (row0, row1, col0, col1) of the source kept; output is always the target size
-LATENT_GOLDENS = {
-    (64, 96, 64, 64): (0, 63, 16, 79),
-    (96, 64, 64, 64): (16, 79, 0, 63),
-    (48, 80, 64, 64): (0, 47, 16, 63),
-    (64, 64, 64, 64): (0, 63, 0, 63),
+# (source latent h, w, picture h, w, x percent, y percent) -> ((first row, last row, first col, last col) of the source that is used, (down, right) offset in the picture)
+GOLDENS = {
+    (64, 96, 64, 64, 50, 50): ((0, 63, 16, 79), (0, 0)),
+    (64, 96, 64, 64, 0, 50): ((0, 63, 0, 63), (0, 0)),
+    (64, 96, 64, 64, 100, 50): ((0, 63, 32, 95), (0, 0)),
+    (96, 64, 64, 64, 50, 50): ((16, 79, 0, 63), (0, 0)),
+    (96, 64, 64, 64, 50, 0): ((0, 63, 0, 63), (0, 0)),
+    (128, 128, 64, 64, 50, 50): ((32, 95, 32, 95), (0, 0)),
+    (128, 128, 64, 64, 100, 100): ((64, 127, 64, 127), (0, 0)),
+    (48, 80, 64, 64, 50, 50): ((0, 47, 8, 71), (8, 0)),            # shorter than the picture: placed; wider: cut
+    (48, 80, 64, 64, 0, 100): ((0, 47, 0, 63), (16, 0)),
+    (32, 40, 64, 64, 50, 50): ((0, 31, 0, 39), (16, 12)),
+    (32, 40, 64, 64, 100, 0): ((0, 31, 0, 39), (0, 24)),
+    (64, 64, 64, 64, 50, 50): ((0, 63, 0, 63), (0, 0)),
 }
 
 
-def test_latent_fit_geometry_is_pinned():
+def test_window_geometry_is_pinned():
     mod = _load_pack()
-    for (sh, sw, H, W), win in LATENT_GOLDENS.items():
+    for (sh, sw, H, W, x, y), (rows_cols, offset) in GOLDENS.items():
+        (y0, x0, h, w), got_offset = mod._window((sh, sw), (H, W), x, y)
+        assert (y0, y0 + h - 1, x0, x0 + w - 1) == rows_cols and got_offset == offset, ((sh, sw, H, W, x, y), (y0, y0 + h - 1, x0, x0 + w - 1), got_offset)
+
+
+def test_the_latent_is_used_at_its_own_scale():
+    """No resizing: every used cell of the picture holds the source cell the window names, unchanged."""
+    mod = _load_pack()
+    for (sh, sw, H, W, x, y), ((r0, r1, c0, c1), (oy, ox)) in GOLDENS.items():
         src = torch.zeros(1, 4, sh, sw)
-        src[:, 0] = torch.linspace(0, 1, sw)[None, None, :]
-        src[:, 1] = torch.linspace(0, 1, sh)[None, :, None]
-        out = mod._fit_src(src, H, W)
-        assert tuple(out.shape[-2:]) == (H, W)
-        got = _window(out[:, 0], out[:, 1], sh, sw)
-        assert all(abs(g - e) <= 1 for g, e in zip(got, win)), ((sh, sw, H, W), got, win)
+        src[:, 0] = torch.arange(sw, dtype=torch.float32)[None, None, :]
+        src[:, 1] = torch.arange(sh, dtype=torch.float32)[None, :, None]
+        placed, _, valid = mod._place_ref(src, torch.zeros(1, sh, sw), float(x), float(y), 0.0, 0.0, (H, W))
+        used = placed[..., oy:oy + (r1 - r0 + 1), ox:ox + (c1 - c0 + 1)]
+        assert torch.equal(used[0, 0], src[0, 0, r0:r1 + 1, c0:c1 + 1]) and torch.equal(used[0, 1], src[0, 1, r0:r1 + 1, c0:c1 + 1]), (sh, sw, H, W, x, y)
+        assert float(valid.sum()) == (r1 - r0 + 1) * (c1 - c0 + 1)
 
 
 if __name__ == "__main__":

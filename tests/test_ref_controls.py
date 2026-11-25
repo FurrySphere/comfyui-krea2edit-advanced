@@ -85,7 +85,7 @@ def test_input_names_are_a_b_symmetric():
     mod = _load_pack()
     it = mod.Krea2EditAdvanced.INPUT_TYPES()
     assert list(it["required"]) == ["model", "source_latent_a", "ref_position_a"]
-    assert list(it["optional"]) == ["source_latent_b", "ref_boost_a", "ref_boost_b", "ref_boost_mask_a", "ref_boost_mask_b", "ref_position_b"]
+    assert list(it["optional"]) == ["source_latent_b", "ref_boost_a", "ref_boost_b", "ref_boost_mask_a", "ref_boost_mask_b", "ref_position_b", "target_latent"]
     names = list(it["required"]) + list(it["optional"])
     for n in names:
         if n.endswith("_b"):
@@ -360,7 +360,7 @@ def test_controls_are_forwarded_unchanged():
     _run_steps(w, n=1)
     k = seen[-1][1]
     assert (k["ref_boost_a"], k["ref_boost_b"]) == (4.0, 2.0)
-    assert k["ref_boost_mask_a"] is ma and k["ref_boost_mask_b"] is mb
+    assert torch.equal(k["ref_boost_mask_a"], ma) and torch.equal(k["ref_boost_mask_b"], mb)
     assert (k["ref_position_a"], k["ref_position_b"]) == (BESIDE, "bag of features")
 
 
